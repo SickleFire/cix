@@ -8,6 +8,7 @@ use tantivy::query::QueryParser;
 use tantivy::schema::*;
 use tantivy::{Index, ReloadPolicy, TantivyDocument, Term, doc};
 use walkdir::WalkDir;
+use colored::*;
 
 fn main() -> tantivy::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -116,7 +117,9 @@ fn main() -> tantivy::Result<()> {
         let query_lower = query_arg.to_lowercase();
         for (line_idx, line) in content_val.lines().enumerate() {
             if line.to_lowercase().contains(&query_lower) {
-                println!("  Line {:>4}: {}", line_idx + 1, line.trim());
+                let line_num = format!("Line {:>4}:", line_idx + 1).blue();
+                let highlighted_line = highlight_match(line.trim(), query_arg);
+                println!("  {} {}", line_num, highlighted_line);
             }
         }
     }
@@ -135,4 +138,26 @@ fn is_indexable_file(path_str: &str) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| allowed_extensions.contains(&ext.to_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+// Case-insensitive substring highlighter that preserves original line casing
+fn highlight_match(line: &str, query: &str) -> String {
+    if query.is_empty() {
+        return line.to_string();
+    }
+
+    let mut highlighted = String::new();
+    let line_lower = line.to_lowercase();
+    let query_lower = query.to_lowercase();
+    let query_len = query.len();
+
+    let mut last_end = 0;
+    for (start, _) in line_lower.match_indices(&query_lower) {
+        highlighted.push_str(&line[last_end..start]);
+        let matched_text = &line[start..start + query_len];
+        highlighted.push_str(&matched_text.bold().red().to_string());
+        last_end = start + query_len;
+    }
+    highlighted.push_str(&line[last_end..]);
+    highlighted
 }

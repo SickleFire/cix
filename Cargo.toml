@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 tantivy = "0.25.0"
 walkdir = "2.4"
+colored = "2.1"
