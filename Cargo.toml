@@ -1,0 +1,8 @@
+[package]
+name = "text-search-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tantivy = "0.25.0"
+walkdir = "2.4"
