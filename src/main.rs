@@ -62,7 +62,7 @@ fn main() -> tantivy::Result<()> {
             let path_str = entry.path().to_string_lossy().to_string();
 
             // Only index Rust files for now
-            if path_str.ends_with(".rs") {
+            if is_indexable_file(&path_str) {
                 if let Ok(metadata) = entry.metadata() {
                     if let Ok(modified_time) = metadata.modified() {
                         let modified_secs =
@@ -109,9 +109,9 @@ fn main() -> tantivy::Result<()> {
         let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
         let path_val = retrieved_doc.get_first(file_path).unwrap().as_str().unwrap();
         let content_val = retrieved_doc.get_first(content).unwrap().as_str().unwrap();
-    
+
         println!("\nScore: {:.2} | File: {}", score, path_val);
-    
+
         // Find and print specific matching lines with line numbers
         let query_lower = query_arg.to_lowercase();
         for (line_idx, line) in content_val.lines().enumerate() {
@@ -122,4 +122,17 @@ fn main() -> tantivy::Result<()> {
     }
 
     Ok(())
+}
+
+fn is_indexable_file(path_str: &str) -> bool {
+    let allowed_extensions = [
+        "rs", "c", "cpp", "h", "hpp", "py", "js", "ts", 
+        "toml", "json", "yaml", "yml", "md", "txt", "sh"
+    ];
+
+    std::path::Path::new(path_str)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| allowed_extensions.contains(&ext.to_lowercase().as_str()))
+        .unwrap_or(false)
 }
