@@ -1,5 +1,7 @@
+use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
@@ -28,7 +30,12 @@ fn main() -> tantivy::Result<()> {
 
     let mut index_writer = index.writer(100_000_000)?;
     let target_directory = query_target_directory;
-    let state_file = format!("{}/.last_run", index_path);
+
+    let mut hasher = DefaultHasher::new();
+    target_directory.hash(&mut hasher);
+    let dir_hash = hasher.finish();
+
+    let state_file = format!("{}/.last_run_{}", index_path, dir_hash);
 
     let last_run: u64 = fs::read_to_string(&state_file)
         .unwrap_or_else(|_| "0".to_string())
@@ -100,23 +107,18 @@ fn main() -> tantivy::Result<()> {
     println!("\nFound {} results for '{}':", top_docs.len(), query_arg);
     for (score, doc_address) in top_docs {
         let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
-        let path_val = retrieved_doc
-            .get_first(file_path)
-            .unwrap()
-            .as_str()
-            .unwrap();
+        let path_val = retrieved_doc.get_first(file_path).unwrap().as_str().unwrap();
         let content_val = retrieved_doc.get_first(content).unwrap().as_str().unwrap();
-
-        let snippet = if content_val.len() > 100 {
-            format!("{}...", &content_val[..100].replace('\n', " "))
-        } else {
-            content_val.replace('\n', " ")
-        };
-
-        println!(
-            " Score: {:.2} | File: {}\n   Snippet: {}",
-            score, path_val, snippet
-        );
+    
+        println!("\nScore: {:.2} | File: {}", score, path_val);
+    
+        // Find and print specific matching lines with line numbers
+        let query_lower = query_arg.to_lowercase();
+        for (line_idx, line) in content_val.lines().enumerate() {
+            if line.to_lowercase().contains(&query_lower) {
+                println!("  Line {:>4}: {}", line_idx + 1, line.trim());
+            }
+        }
     }
 
     Ok(())
