@@ -10,3 +10,6 @@ Features
 - Duplicate-Safe Upserts: Uses exact-match path terms (delete_term) to update modified files without duplicating documents in the index.
 
 - Persistent Disk Storage: Stores memory-mapped inverted indexes (MmapDirectory) on disk for instant subsequent lookups.
+
+## Usage
+`cix <target_directory> <search_query>`
