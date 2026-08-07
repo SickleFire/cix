@@ -12,4 +12,7 @@ Features
 - Persistent Disk Storage: Stores memory-mapped inverted indexes (MmapDirectory) on disk for instant subsequent lookups.
 
 ## Usage
-`cix <target_directory> <search_query>`
+`cix <search_query> <target_directory>`
+
+<img width="622" height="176" alt="image" src="https://github.com/user-attachments/assets/753df8bf-291c-437f-b6d8-ae919c25560e" />
+
