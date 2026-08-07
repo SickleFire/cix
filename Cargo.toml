@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 tantivy = "0.25.0"
-walkdir = "2.4"
+ignore = "0.4"
+dirs = "5.0"
 colored = "2.1"
