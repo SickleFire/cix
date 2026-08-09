@@ -566,8 +566,15 @@ fn run_search_pipeline(
 
 struct EditBlock {
     file_path: String,
+    mode: EditMode,
     search: String,
     replace: String,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum EditMode {
+    Replace,
+    Append,
 }
 
 /// Executes the code editing pipeline: retrieves relevant code context, requests
@@ -607,7 +614,7 @@ async fn run_edit_pipeline(
 
     let mut context_payload = String::new();
     let mut seen_paths = HashSet::new();
-    let mut example_snippet: Option<(String, String)> = None; // (path, first_line) for Gemini's few-shot example
+    let mut example_snippet: Option<(String, String)> = None; // (path, first_line) for the few-shot example
     println!("{}", "Target files for context:".dimmed());
 
     for (_, doc_address) in top_docs {
@@ -690,21 +697,36 @@ async fn run_edit_pipeline(
             format_example, context_payload, instruction
         )
     } else {
+        let anchor_example = match &example_snippet {
+            Some((path, line)) => format!(
+                "\nExample of adding NEW content at the end of a file:\n\
+                {{\"file_path\": \"{}\", \"mode\": \"append\", \"search\": \"\", \"replace\": \"<new content goes here>\"}}\n\
+                (append mode adds `replace` to the end of the file — no anchor needed)\n\n\
+                Example of changing EXISTING content (format only — base the real search on a line \
+                that actually appears in the codebase context below, not on this example):\n\
+                {{\"file_path\": \"{}\", \"mode\": \"replace\", \"search\": \"{}\", \"replace\": \"<updated line>\"}}\n",
+                path, path, line
+            ),
+            None => String::new(),
+        };
+
         format!(
             "You are an AI coding agent modifying source code.\n\
             For each change needed, provide:\n\
             - file_path: the exact path as it appears in CODEBASE CONTEXT below\n\
-            - search: text copied verbatim from that file's content — never invent, paraphrase, \
-              or reformat it. It must match the file exactly so it can be located and replaced.\n\
-            - replace: the new text that should take its place\n\n\
+            - mode: either \"replace\" (change existing text) or \"append\" (add new text to the end of the file)\n\
+            - search: for mode \"replace\", text copied verbatim from that file's content — never invent, \
+              paraphrase, or reformat it. It must match the file exactly so it can be located and replaced. \
+              For mode \"append\", leave this as an empty string.\n\
+            - replace: for mode \"replace\", the new text that should take the place of search. \
+              For mode \"append\", the new content to add at the end of the file.\n\n\
             Keep each search value small and unique enough to match exactly once. Preserve exact indentation.\n\n\
-            IMPORTANT: search can never be empty. If you are ADDING new code rather than changing \
-            existing code, pick a short existing line near where the addition belongs (e.g. the last \
-            line of a function, or a closing brace) as search, and set replace to that same line \
-            followed by the new code on the following lines.\n\n\
+            IMPORTANT: If the instruction asks to ADD new content (e.g. a new section, a new line, \
+            \"at the bottom\", \"at the end\"), use mode \"append\" rather than trying to force it \
+            through a replace block.\n{}\n\
             CODEBASE CONTEXT:\n{}\n\n\
             INSTRUCTION:\n{}\n",
-            context_payload, instruction
+            anchor_example, context_payload, instruction
         )
     };
 
@@ -769,8 +791,9 @@ async fn run_edit_pipeline(
         ollama_res.response
     };
 
-    // Gemini's response is still marker-format text; Ollama's is
-    // schema-constrained JSON. Parse each with the matching parser.
+    // Gemini's response is still marker-format text (replace-only); Ollama's
+    // is schema-constrained JSON (replace + append). Parse each with the
+    // matching parser.
     let edit_blocks = if use_gemini {
         parse_edit_blocks(&response_text)
     } else {
@@ -819,19 +842,23 @@ async fn run_edit_pipeline(
             }
         };
 
-        let normalized_content = content.replace("\r\n", "\n");
-        let normalized_search = block.search.replace("\r\n", "\n");
+        // Append blocks don't need SEARCH text to exist anywhere — they just
+        // need a readable target file, which we already confirmed above.
+        if block.mode == EditMode::Replace {
+            let normalized_content = content.replace("\r\n", "\n");
+            let normalized_search = block.search.replace("\r\n", "\n");
 
-        if !normalized_content.contains(&normalized_search) {
-            eprintln!(
-                "{}",
-                format!(
-                    " Skipping block: SEARCH text not found in {}",
-                    resolved.display()
-                )
-                .yellow()
-            );
-            continue;
+            if !normalized_content.contains(&normalized_search) {
+                eprintln!(
+                    "{}",
+                    format!(
+                        " Skipping block: SEARCH text not found in {}",
+                        resolved.display()
+                    )
+                    .yellow()
+                );
+                continue;
+            }
         }
 
         valid_blocks.push((block, resolved));
@@ -855,11 +882,21 @@ async fn run_edit_pipeline(
 
     for (block, resolved) in &valid_blocks {
         println!("\nFile: {}", resolved.display().to_string().bold().green());
-        for line in block.search.lines() {
-            println!("  {}", format!("- {}", line).red());
-        }
-        for line in block.replace.lines() {
-            println!("  {}", format!("+ {}", line).green());
+        match block.mode {
+            EditMode::Replace => {
+                for line in block.search.lines() {
+                    println!("  {}", format!("- {}", line).red());
+                }
+                for line in block.replace.lines() {
+                    println!("  {}", format!("+ {}", line).green());
+                }
+            }
+            EditMode::Append => {
+                println!("  {}", "(appending to end of file)".dimmed());
+                for line in block.replace.lines() {
+                    println!("  {}", format!("+ {}", line).green());
+                }
+            }
         }
     }
 
@@ -902,6 +939,8 @@ async fn run_edit_pipeline(
 }
 
 /// Parses marker-format SEARCH/REPLACE blocks from a text response (Gemini path).
+/// Gemini's prompt only teaches the replace format, so every parsed block is
+/// tagged `EditMode::Replace`.
 fn parse_edit_blocks(raw_text: &str) -> Vec<EditBlock> {
     let mut blocks = Vec::new();
     let mut current_file = String::new();
@@ -928,6 +967,7 @@ fn parse_edit_blocks(raw_text: &str) -> Vec<EditBlock> {
             if !current_file.is_empty() && !search_lines.is_empty() {
                 blocks.push(EditBlock {
                     file_path: current_file.clone(),
+                    mode: EditMode::Replace,
                     search: search_lines.join("\n"),
                     replace: replace_lines.join("\n"),
                 });
@@ -943,8 +983,8 @@ fn parse_edit_blocks(raw_text: &str) -> Vec<EditBlock> {
 }
 
 /// JSON schema used to constrain Ollama's decoding for `cix edit` so the
-/// response can only ever be a list of `{file_path, search, replace}` objects
-/// — no prose, no markdown fences, no half-finished blocks.
+/// response can only ever be a list of `{file_path, mode, search, replace}`
+/// objects — no prose, no markdown fences, no half-finished blocks.
 fn edit_blocks_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -954,11 +994,12 @@ fn edit_blocks_schema() -> serde_json::Value {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "file_path": { "type": "string" },
+                        "file_path": { "type": "string", "minLength": 1 },
+                        "mode": { "type": "string", "enum": ["replace", "append"] },
                         "search": { "type": "string" },
-                        "replace": { "type": "string" }
+                        "replace": { "type": "string", "minLength": 1 }
                     },
-                    "required": ["file_path", "search", "replace"]
+                    "required": ["file_path", "mode", "replace"]
                 }
             }
         },
@@ -974,6 +1015,8 @@ struct EditBlocksResponse {
 #[derive(Deserialize)]
 struct EditBlockJson {
     file_path: String,
+    mode: String,
+    #[serde(default)]
     search: String,
     replace: String,
 }
@@ -984,24 +1027,53 @@ fn parse_edit_blocks_json(raw_text: &str) -> Vec<EditBlock> {
         Ok(resp) => resp
             .edits
             .into_iter()
-            .filter(|e| {
-                if e.file_path.is_empty() || e.search.is_empty() {
+            .filter_map(|e| {
+                if e.file_path.is_empty() {
+                    eprintln!("{}", " Dropping block with empty file_path".yellow());
+                    return None;
+                }
+                if e.replace.is_empty() {
+                    eprintln!(
+                        "{}",
+                        format!(" Dropping block with empty replace for {}", e.file_path).yellow()
+                    );
+                    return None;
+                }
+
+                let mode = match e.mode.as_str() {
+                    "append" => EditMode::Append,
+                    "replace" => EditMode::Replace,
+                    other => {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                " Unrecognized mode '{}' for {}, treating as replace",
+                                other, e.file_path
+                            )
+                            .yellow()
+                        );
+                        EditMode::Replace
+                    }
+                };
+
+                if mode == EditMode::Replace && e.search.is_empty() {
                     eprintln!(
                         "{}",
                         format!(
-                            " Dropping block with empty file_path/search for {}",
-                            if e.file_path.is_empty() { "<empty>" } else { &e.file_path }
+                            " Dropping replace block with empty search for {}",
+                            e.file_path
                         )
                         .yellow()
                     );
-                    return false;
+                    return None;
                 }
-                true
-            })
-            .map(|e| EditBlock {
-                file_path: e.file_path,
-                search: e.search,
-                replace: e.replace,
+
+                Some(EditBlock {
+                    file_path: e.file_path,
+                    mode,
+                    search: e.search,
+                    replace: e.replace,
+                })
             })
             .collect(),
         Err(_) => Vec::new(),
@@ -1048,7 +1120,9 @@ fn resolve_file_path(proposed_path: &str, target_dir: &str) -> Option<std::path:
     None
 }
 
-/// Applies a list of `EditBlock` modifications to files on disk, handling line ending normalization.
+/// Applies a list of `EditBlock` modifications to files on disk, handling line
+/// ending normalization. `Replace` blocks find-and-replace a verbatim SEARCH
+/// match; `Append` blocks add `replace` to the end of the file unconditionally.
 fn apply_edit_blocks(
     blocks: &[EditBlock],
     target_dir: &str,
@@ -1069,32 +1143,60 @@ fn apply_edit_blocks(
 
         let content = fs::read_to_string(&file_path)?;
 
-        let normalized_content = content.replace("\r\n", "\n");
-        let normalized_search = block.search.replace("\r\n", "\n");
-        let normalized_replace = block.replace.replace("\r\n", "\n");
+        match block.mode {
+            EditMode::Replace => {
+                let normalized_content = content.replace("\r\n", "\n");
+                let normalized_search = block.search.replace("\r\n", "\n");
+                let normalized_replace = block.replace.replace("\r\n", "\n");
 
-        if !normalized_content.contains(&normalized_search) {
-            eprintln!(
-                "{}",
-                format!(
-                    " Search block missing or mismatched in {}",
-                    file_path.display()
-                )
-                .red()
-            );
-            continue;
+                if !normalized_content.contains(&normalized_search) {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            " Search block missing or mismatched in {}",
+                            file_path.display()
+                        )
+                        .red()
+                    );
+                    continue;
+                }
+
+                let new_content =
+                    normalized_content.replacen(&normalized_search, &normalized_replace, 1);
+
+                let final_content = if content.contains("\r\n") {
+                    new_content.replace('\n', "\r\n")
+                } else {
+                    new_content
+                };
+
+                fs::write(&file_path, final_content)?;
+                applied_count += 1;
+            }
+            EditMode::Append => {
+                let normalized_replace = block.replace.replace("\r\n", "\n");
+                let separator = if content.is_empty() || content.ends_with('\n') {
+                    ""
+                } else {
+                    "\n"
+                };
+                let new_content = format!(
+                    "{}{}{}\n",
+                    content.replace("\r\n", "\n"),
+                    separator,
+                    normalized_replace
+                );
+
+                let final_content = if content.contains("\r\n") {
+                    new_content.replace('\n', "\r\n")
+                } else {
+                    new_content
+                };
+
+                fs::write(&file_path, final_content)?;
+                applied_count += 1;
+            }
         }
-
-        let new_content = normalized_content.replacen(&normalized_search, &normalized_replace, 1);
-
-        let final_content = if content.contains("\r\n") {
-            new_content.replace('\n', "\r\n")
-        } else {
-            new_content
-        };
-
-        fs::write(&file_path, final_content)?;
-        applied_count += 1;
     }
 
     Ok(applied_count)
