@@ -9,6 +9,7 @@ use futures_util::StreamExt;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
@@ -107,6 +108,12 @@ struct OllamaRequest {
     model: String,
     prompt: String,
     stream: bool,
+    /// JSON schema for constrained decoding. `None` for free-form answers
+    /// (e.g. `cix ask`), `Some(schema)` when the response must match a
+    /// structural contract (e.g. `cix edit`'s edit-block list). Skipped
+    /// entirely when absent so Ollama sees no `format` field at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -276,11 +283,7 @@ async fn run_ask_pipeline(
 
     // Search across both file path and content fields
     let query_parser = QueryParser::for_index(&index, vec![file_path_field, content_field]);
-    let search_terms = extract_keywords(question);
-
-    let query = query_parser
-        .parse_query(&search_terms)
-        .unwrap_or_else(|_| query_parser.parse_query("*").unwrap());
+    let query = parse_query_with_fuzzy(&query_parser, question);
 
     let mut top_docs = searcher.search(&query, &TopDocs::with_limit(4).and_offset(0))?;
 
@@ -297,6 +300,7 @@ async fn run_ask_pipeline(
     }
 
     let mut context_payload = String::new();
+    let mut seen_paths = HashSet::new();
     println!("{}", "Found relevant context in:".dimmed());
 
     for (_, doc_address) in top_docs {
@@ -306,6 +310,13 @@ async fn run_ask_pipeline(
             .unwrap()
             .as_str()
             .unwrap();
+
+        // Skip duplicate hits for the same file so it isn't fed to the model
+        // multiple times (wastes context budget and confuses smaller models).
+        if !seen_paths.insert(path.to_string()) {
+            continue;
+        }
+
         let content = retrieved_doc
             .get_first(content_field)
             .unwrap()
@@ -400,6 +411,10 @@ async fn run_ask_pipeline(
                 model: model.to_string(),
                 prompt,
                 stream: true,
+                // `ask` is free-form Q&A — no schema constraint. Forcing it
+                // into the edit-block JSON shape would make every answer
+                // garbage or empty.
+                format: None,
             })
             .send()
             .await;
@@ -458,15 +473,7 @@ fn run_search_pipeline(
     let searcher = reader.searcher();
 
     let query_parser = QueryParser::for_index(&index, vec![file_path, content]);
-    let search_terms = extract_keywords(query_arg);
-
-    let query = match query_parser.parse_query(&search_terms) {
-        Ok(q) => q,
-        Err(_) => {
-            eprintln!("Invalid query format.");
-            return Ok(());
-        }
-    };
+    let query = parse_query_with_fuzzy(&query_parser, query_arg);
 
     let top_docs = searcher.search(&query, &TopDocs::with_limit(result_limit).and_offset(0))?;
 
@@ -495,13 +502,17 @@ fn run_search_pipeline(
 
         let lines: Vec<&str> = content_val.lines().collect();
         let total_lines = lines.len();
-        let query_lower = extract_keywords(query_arg).to_lowercase();
+        let keywords: Vec<String> = extract_keywords(query_arg)
+            .split_whitespace()
+            .map(|s| s.to_lowercase())
+            .collect();
 
-        let matching_indices: Vec<usize> = lines
+        let mut matching_indices: Vec<usize> = lines
             .iter()
             .enumerate()
             .filter_map(|(idx, line): (usize, &&str)| {
-                if line.to_lowercase().contains(&query_lower) {
+                let line_lower = line.to_lowercase();
+                if keywords.iter().any(|kw| line_matches_keyword(&line_lower, kw)) {
                     Some(idx)
                 } else {
                     None
@@ -509,8 +520,8 @@ fn run_search_pipeline(
             })
             .collect();
 
-        if matching_indices.is_empty() {
-            continue;
+        if matching_indices.is_empty() && !lines.is_empty() {
+            matching_indices.push(0);
         }
 
         let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -560,7 +571,8 @@ struct EditBlock {
 }
 
 /// Executes the code editing pipeline: retrieves relevant code context, requests
-/// structured SEARCH/REPLACE diff blocks from Gemini, and applies changes on confirmation.
+/// structured edit blocks from Gemini (marker-format text) or Ollama
+/// (schema-constrained JSON), and applies changes on confirmation.
 async fn run_edit_pipeline(
     instruction: &str,
     model: &str,
@@ -578,10 +590,7 @@ async fn run_edit_pipeline(
     let searcher = reader.searcher();
 
     let query_parser = QueryParser::for_index(&index, vec![file_path_field, content_field]);
-    let search_terms = extract_keywords(instruction);
-    let query = query_parser
-        .parse_query(&search_terms)
-        .unwrap_or_else(|_| query_parser.parse_query("*").unwrap());
+    let query = parse_query_with_fuzzy(&query_parser, instruction);
 
     let mut top_docs = searcher.search(&query, &TopDocs::with_limit(3).and_offset(0))?;
 
@@ -597,6 +606,8 @@ async fn run_edit_pipeline(
     }
 
     let mut context_payload = String::new();
+    let mut seen_paths = HashSet::new();
+    let mut example_snippet: Option<(String, String)> = None; // (path, first_line) for Gemini's few-shot example
     println!("{}", "Target files for context:".dimmed());
 
     for (_, doc_address) in top_docs {
@@ -606,39 +617,95 @@ async fn run_edit_pipeline(
             .unwrap()
             .as_str()
             .unwrap();
+
+        // Skip duplicate hits for the same file.
+        if !seen_paths.insert(path.to_string()) {
+            continue;
+        }
+
         let content = retrieved_doc
             .get_first(content_field)
             .unwrap()
             .as_str()
             .unwrap();
 
+        if example_snippet.is_none() {
+            if let Some(first_line) = content.lines().find(|l| !l.trim().is_empty()) {
+                example_snippet = Some((path.to_string(), first_line.to_string()));
+            }
+        }
+
         println!("  • {}", path.bold().green());
         context_payload.push_str(&format!("\n--- FILE: {} ---\n{}\n", path, content));
     }
-
-    let prompt = format!(
-        "You are an AI coding agent modifying source code.\n\
-        Perform the requested edit strictly using SEARCH/REPLACE blocks formatted exactly as follows:\n\n\
-        FILE: path/to/file.ext\n\
-        <<<<<<< SEARCH\n\
-        exact code lines to match and replace\n\
-        =======\n\
-        new code lines to insert\n\
-        >>>>>>> REPLACE\n\n\
-        Rules:\n\
-        1. Keep SEARCH blocks small and unique so they match accurately.\n\
-        2. Preserve exact indentation.\n\
-        3. Do not output conversational text or markdown code fences outside of the block structure.\n\n\
-        CODEBASE CONTEXT:\n{}\n\n\
-        INSTRUCTION:\n{}\n",
-        context_payload, instruction
-    );
 
     let client = reqwest::Client::new();
     let use_gemini = match provider.to_lowercase().as_str() {
         "gemini" => true,
         "ollama" | "local" => false,
         _ => model.to_lowercase().contains("gemini"),
+    };
+
+    // Gemini has no constrained-decoding hookup here, so it still needs the
+    // marker-format prompt (with a grounded few-shot example — small/medium
+    // models imitate an abstract placeholder literally rather than treating
+    // it as a template). Ollama's output shape is guaranteed by the JSON
+    // schema passed via `format`, so its prompt only needs to describe what
+    // goes in each field, not how to format the response.
+    let prompt = if use_gemini {
+        let format_example = match &example_snippet {
+            Some((path, line)) => format!(
+                "Example (format only — base the SEARCH text on lines that actually \
+                appear in the codebase context below, not on this example):\n\
+                FILE: {}\n\
+                <<<<<<< SEARCH\n\
+                {}\n\
+                =======\n\
+                {}\n\
+                >>>>>>> REPLACE\n",
+                path, line, line
+            ),
+            None => String::from(
+                "Example (format only):\n\
+                FILE: path/to/file.ext\n\
+                <<<<<<< SEARCH\n\
+                exact code lines to match and replace\n\
+                =======\n\
+                new code lines to insert\n\
+                >>>>>>> REPLACE\n",
+            ),
+        };
+
+        format!(
+            "You are an AI coding agent modifying source code.\n\
+            Perform the requested edit strictly using SEARCH/REPLACE blocks formatted exactly as follows:\n\n\
+            {}\n\
+            Rules:\n\
+            1. Keep SEARCH blocks small and unique so they match accurately.\n\
+            2. Preserve exact indentation.\n\
+            3. The SEARCH text must be copied verbatim from the CODEBASE CONTEXT below — never invent or paraphrase it.\n\
+            4. Do not output conversational text or markdown code fences outside of the block structure.\n\n\
+            CODEBASE CONTEXT:\n{}\n\n\
+            INSTRUCTION:\n{}\n",
+            format_example, context_payload, instruction
+        )
+    } else {
+        format!(
+            "You are an AI coding agent modifying source code.\n\
+            For each change needed, provide:\n\
+            - file_path: the exact path as it appears in CODEBASE CONTEXT below\n\
+            - search: text copied verbatim from that file's content — never invent, paraphrase, \
+              or reformat it. It must match the file exactly so it can be located and replaced.\n\
+            - replace: the new text that should take its place\n\n\
+            Keep each search value small and unique enough to match exactly once. Preserve exact indentation.\n\n\
+            IMPORTANT: search can never be empty. If you are ADDING new code rather than changing \
+            existing code, pick a short existing line near where the addition belongs (e.g. the last \
+            line of a function, or a closing brace) as search, and set replace to that same line \
+            followed by the new code on the following lines.\n\n\
+            CODEBASE CONTEXT:\n{}\n\n\
+            INSTRUCTION:\n{}\n",
+            context_payload, instruction
+        )
     };
 
     let response_text = if use_gemini {
@@ -690,6 +757,10 @@ async fn run_edit_pipeline(
                 model: model.to_string(),
                 prompt,
                 stream: false,
+                // Constrain decoding to the edit-block schema so the model
+                // physically cannot emit prose, markdown fences, or a
+                // half-finished block — only valid JSON matching the shape.
+                format: Some(edit_blocks_schema()),
             })
             .send()
             .await?;
@@ -698,12 +769,78 @@ async fn run_edit_pipeline(
         ollama_res.response
     };
 
-    let edit_blocks = parse_edit_blocks(&response_text);
+    // Gemini's response is still marker-format text; Ollama's is
+    // schema-constrained JSON. Parse each with the matching parser.
+    let edit_blocks = if use_gemini {
+        parse_edit_blocks(&response_text)
+    } else {
+        parse_edit_blocks_json(&response_text)
+    };
 
     if edit_blocks.is_empty() {
         println!(
             "{}",
             "No valid edit blocks were generated by the AI.".yellow()
+        );
+        println!("\n{}", "--- Raw model output (for debugging) ---".dimmed());
+        println!("{}", response_text);
+        return Ok(());
+    }
+
+    // Pre-validate every block against the actual file on disk *before*
+    // showing anything to the user, so we never present a diff that can't
+    // possibly be applied (missing file, or SEARCH text that doesn't match).
+    let mut valid_blocks: Vec<(EditBlock, std::path::PathBuf)> = Vec::new();
+
+    for block in edit_blocks {
+        let resolved = match resolve_file_path(&block.file_path, target_dir) {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "{}",
+                    format!(
+                        " Skipping block: file not found: {}",
+                        block.file_path
+                    )
+                    .yellow()
+                );
+                continue;
+            }
+        };
+
+        let content = match fs::read_to_string(&resolved) {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!(
+                    "{}",
+                    format!(" Skipping block: could not read {}", resolved.display()).yellow()
+                );
+                continue;
+            }
+        };
+
+        let normalized_content = content.replace("\r\n", "\n");
+        let normalized_search = block.search.replace("\r\n", "\n");
+
+        if !normalized_content.contains(&normalized_search) {
+            eprintln!(
+                "{}",
+                format!(
+                    " Skipping block: SEARCH text not found in {}",
+                    resolved.display()
+                )
+                .yellow()
+            );
+            continue;
+        }
+
+        valid_blocks.push((block, resolved));
+    }
+
+    if valid_blocks.is_empty() {
+        println!(
+            "{}",
+            "No valid, applicable edit blocks were generated by the AI.".yellow()
         );
         return Ok(());
     }
@@ -714,8 +851,8 @@ async fn run_edit_pipeline(
         "==================================================".dimmed()
     );
 
-    for block in &edit_blocks {
-        println!("\nFile: {}", block.file_path.bold().green());
+    for (block, resolved) in &valid_blocks {
+        println!("\nFile: {}", resolved.display().to_string().bold().green());
         for line in block.search.lines() {
             println!("  {}", format!("- {}", line).red());
         }
@@ -735,7 +872,8 @@ async fn run_edit_pipeline(
     std::io::stdin().read_line(&mut input)?;
 
     if input.trim().eq_ignore_ascii_case("y") {
-        let applied_count = apply_edit_blocks(&edit_blocks, target_dir)?;
+        let blocks_only: Vec<EditBlock> = valid_blocks.into_iter().map(|(b, _)| b).collect();
+        let applied_count = apply_edit_blocks(&blocks_only, target_dir)?;
         if applied_count > 0 {
             println!(
                 "{}",
@@ -761,7 +899,7 @@ async fn run_edit_pipeline(
     Ok(())
 }
 
-/// Parses structured SEARCH/REPLACE blocks from the AI model's text response.
+/// Parses marker-format SEARCH/REPLACE blocks from a text response (Gemini path).
 fn parse_edit_blocks(raw_text: &str) -> Vec<EditBlock> {
     let mut blocks = Vec::new();
     let mut current_file = String::new();
@@ -782,11 +920,16 @@ fn parse_edit_blocks(raw_text: &str) -> Vec<EditBlock> {
             replace_lines.clear();
         } else if line.starts_with(">>>>>>> REPLACE") {
             in_replace = false;
-            blocks.push(EditBlock {
-                file_path: current_file.clone(),
-                search: search_lines.join("\n"),
-                replace: replace_lines.join("\n"),
-            });
+            // Guard against emitting garbage blocks: skip anything without a
+            // real target file or an empty SEARCH section (both indicate the
+            // model didn't ground its output in the actual context).
+            if !current_file.is_empty() && !search_lines.is_empty() {
+                blocks.push(EditBlock {
+                    file_path: current_file.clone(),
+                    search: search_lines.join("\n"),
+                    replace: replace_lines.join("\n"),
+                });
+            }
         } else if in_search {
             search_lines.push(line);
         } else if in_replace {
@@ -795,6 +938,72 @@ fn parse_edit_blocks(raw_text: &str) -> Vec<EditBlock> {
     }
 
     blocks
+}
+
+/// JSON schema used to constrain Ollama's decoding for `cix edit` so the
+/// response can only ever be a list of `{file_path, search, replace}` objects
+/// — no prose, no markdown fences, no half-finished blocks.
+fn edit_blocks_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "edits": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": { "type": "string" },
+                        "search": { "type": "string" },
+                        "replace": { "type": "string" }
+                    },
+                    "required": ["file_path", "search", "replace"]
+                }
+            }
+        },
+        "required": ["edits"]
+    })
+}
+
+#[derive(Deserialize)]
+struct EditBlocksResponse {
+    edits: Vec<EditBlockJson>,
+}
+
+#[derive(Deserialize)]
+struct EditBlockJson {
+    file_path: String,
+    search: String,
+    replace: String,
+}
+
+/// Parses schema-constrained JSON edit blocks from an Ollama response.
+fn parse_edit_blocks_json(raw_text: &str) -> Vec<EditBlock> {
+    match serde_json::from_str::<EditBlocksResponse>(raw_text) {
+        Ok(resp) => resp
+            .edits
+            .into_iter()
+            .filter(|e| {
+                if e.file_path.is_empty() || e.search.is_empty() {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            " Dropping block with empty file_path/search for {}",
+                            if e.file_path.is_empty() { "<empty>" } else { &e.file_path }
+                        )
+                        .yellow()
+                    );
+                    return false;
+                }
+                true
+            })
+            .map(|e| EditBlock {
+                file_path: e.file_path,
+                search: e.search,
+                replace: e.replace,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Resolves candidate file paths proposed by the AI to actual paths on disk.
@@ -997,28 +1206,184 @@ fn is_indexable_file(path_str: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Highlights search query keyword matches in a code line using ANSI color formatting.
+/// Constructs a Tantivy query from user input, applying fuzzy search terms (~1)
+/// to keywords so search handles typos and approximate matches.
+fn parse_query_with_fuzzy(
+    query_parser: &QueryParser,
+    input_text: &str,
+) -> Box<dyn tantivy::query::Query> {
+    let keywords = extract_keywords(input_text);
+    if keywords.trim().is_empty() {
+        return query_parser
+            .parse_query("*")
+            .unwrap_or_else(|_| query_parser.parse_query("").unwrap());
+    }
+
+    let fuzzy_terms: String = keywords
+        .split_whitespace()
+        .map(|w| {
+            if w.contains('~') || w.contains('*') || w.contains(':') || w.contains('"') {
+                w.to_string()
+            } else if w.len() > 2 {
+                format!("{}~1", w)
+            } else {
+                w.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let combined_query_str = if fuzzy_terms != keywords {
+        format!("({}) OR ({})", keywords, fuzzy_terms)
+    } else {
+        keywords.clone()
+    };
+
+    if let Ok(q) = query_parser.parse_query(&combined_query_str) {
+        return q;
+    }
+
+    if let Ok(q) = query_parser.parse_query(&keywords) {
+        return q;
+    }
+
+    if let Ok(q) = query_parser.parse_query(&fuzzy_terms) {
+        return q;
+    }
+
+    query_parser.parse_query("*").unwrap()
+}
+
+/// Checks if a line matches a keyword either as a substring or via fuzzy matching.
+fn line_matches_keyword(line_lower: &str, kw: &str) -> bool {
+    if line_lower.contains(kw) {
+        return true;
+    }
+    let words = line_lower.split(|c: char| !c.is_alphanumeric() && c != '_');
+    for word in words {
+        if !word.is_empty() && is_fuzzy_match(kw, word) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Determines if two words match fuzzily based on Levenshtein distance.
+fn is_fuzzy_match(keyword: &str, word: &str) -> bool {
+    let kw_len = keyword.len();
+    let w_len = word.len();
+
+    if kw_len == 0 || w_len == 0 {
+        return false;
+    }
+
+    if word.contains(keyword) || keyword.contains(word) {
+        return true;
+    }
+
+    let max_dist = if kw_len <= 3 { 0 } else if kw_len <= 6 { 1 } else { 2 };
+    let len_diff = if kw_len > w_len {
+        kw_len - w_len
+    } else {
+        w_len - kw_len
+    };
+
+    if len_diff > max_dist {
+        return false;
+    }
+
+    levenshtein_distance(keyword, word) <= max_dist
+}
+
+/// Computes the Levenshtein distance between two string slices.
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let len_a = a_chars.len();
+    let len_b = b_chars.len();
+
+    if len_a == 0 {
+        return len_b;
+    }
+    if len_b == 0 {
+        return len_a;
+    }
+
+    let mut dp = vec![vec![0; len_b + 1]; len_a + 1];
+
+    for i in 0..=len_a {
+        dp[i][0] = i;
+    }
+    for j in 0..=len_b {
+        dp[0][j] = j;
+    }
+
+    for i in 1..=len_a {
+        for j in 1..=len_b {
+            let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                0
+            } else {
+                1
+            };
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
+        }
+    }
+
+    dp[len_a][len_b]
+}
+
+/// Highlights search query keyword matches (including fuzzy matches) in a code line using ANSI color formatting.
 fn highlight_match(line: &str, query: &str) -> String {
-    if query.is_empty() {
+    let keywords: Vec<String> = extract_keywords(query)
+        .split_whitespace()
+        .map(|s| s.to_lowercase())
+        .collect();
+
+    if keywords.is_empty() {
         return line.to_string();
     }
 
-    let mut highlighted = String::new();
-    let line_lower = line.to_lowercase();
-    let query_lower = extract_keywords(query).to_lowercase();
-    let query_len = query_lower.len();
+    let mut result = String::new();
+    let mut current_token = String::new();
+    let mut is_alphanumeric_mode = false;
 
-    if query_len == 0 {
-        return line.to_string();
+    for c in line.chars() {
+        let is_alphanumeric = c.is_alphanumeric() || c == '_';
+        if is_alphanumeric == is_alphanumeric_mode {
+            current_token.push(c);
+        } else {
+            if !current_token.is_empty() {
+                if is_alphanumeric_mode {
+                    let token_lower = current_token.to_lowercase();
+                    if keywords.iter().any(|kw| line_matches_keyword(&token_lower, kw)) {
+                        result.push_str(&current_token.bold().red().to_string());
+                    } else {
+                        result.push_str(&current_token);
+                    }
+                } else {
+                    result.push_str(&current_token);
+                }
+            }
+            current_token = String::new();
+            current_token.push(c);
+            is_alphanumeric_mode = is_alphanumeric;
+        }
     }
 
-    let mut last_end = 0;
-    for (start, _) in line_lower.match_indices(&query_lower) {
-        highlighted.push_str(&line[last_end..start]);
-        let matched_text = &line[start..start + query_len];
-        highlighted.push_str(&matched_text.bold().red().to_string());
-        last_end = start + query_len;
+    if !current_token.is_empty() {
+        if is_alphanumeric_mode {
+            let token_lower = current_token.to_lowercase();
+            if keywords.iter().any(|kw| line_matches_keyword(&token_lower, kw)) {
+                result.push_str(&current_token.bold().red().to_string());
+            } else {
+                result.push_str(&current_token);
+            }
+        } else {
+            result.push_str(&current_token);
+        }
     }
-    highlighted.push_str(&line[last_end..]);
-    highlighted
+
+    result
 }
