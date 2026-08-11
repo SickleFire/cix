@@ -274,7 +274,8 @@ async fn run_ask_pipeline(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "Retrieving codebase context...".cyan());
 
-    let (index, file_path_field, content_field) = ensure_index(target_dir, false, app_cache_dir)?;
+    let (index, file_path_field, content_field, start_line_field, end_line_field) =
+        ensure_index(target_dir, false, app_cache_dir)?;
     let reader = index
         .reader_builder()
         .reload_policy(ReloadPolicy::OnCommitWithDelay)
@@ -300,31 +301,28 @@ async fn run_ask_pipeline(
     }
 
     let mut context_payload = String::new();
-    let mut seen_paths = HashSet::new();
     println!("{}", "Found relevant context in:".dimmed());
 
-    for (_, doc_address) in top_docs {
-        let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
-        let path = retrieved_doc
-            .get_first(file_path_field)
-            .unwrap()
-            .as_str()
-            .unwrap();
+    let merged_chunks = build_merged_context_chunks(
+        &top_docs,
+        &searcher,
+        file_path_field,
+        content_field,
+        start_line_field,
+        end_line_field,
+    )?;
 
-        // Skip duplicate hits for the same file so it isn't fed to the model
-        // multiple times (wastes context budget and confuses smaller models).
-        if !seen_paths.insert(path.to_string()) {
-            continue;
-        }
-
-        let content = retrieved_doc
-            .get_first(content_field)
-            .unwrap()
-            .as_str()
-            .unwrap();
-
-        println!("  • {}", path.bold().green());
-        context_payload.push_str(&format!("\n--- FILE: {} ---\n{}\n", path, content));
+    for chunk in &merged_chunks {
+        println!(
+            "  • {} (lines {}-{})",
+            chunk.path.bold().green(),
+            chunk.start_line,
+            chunk.end_line
+        );
+        context_payload.push_str(&format!(
+            "\n--- FILE: {} (lines {}-{}) ---\n{}\n",
+            chunk.path, chunk.start_line, chunk.end_line, chunk.content
+        ));
     }
 
     let prompt = format!(
@@ -464,7 +462,8 @@ fn run_search_pipeline(
     reindex: bool,
     app_cache_dir: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (index, file_path, content) = ensure_index(target_directory, reindex, app_cache_dir)?;
+    let (index, file_path, content, _start_line, _end_line) =
+        ensure_index(target_directory, reindex, app_cache_dir)?;
 
     let reader = index
         .reader_builder()
@@ -592,7 +591,8 @@ async fn run_edit_pipeline(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "Retrieving relevant context for edit...".cyan());
 
-    let (index, file_path_field, content_field) = ensure_index(target_dir, false, app_cache_dir)?;
+    let (index, file_path_field, content_field, start_line_field, end_line_field) =
+        ensure_index(target_dir, false, app_cache_dir)?;
     let reader = index
         .reader_builder()
         .reload_policy(ReloadPolicy::OnCommitWithDelay)
@@ -616,37 +616,35 @@ async fn run_edit_pipeline(
     }
 
     let mut context_payload = String::new();
-    let mut seen_paths = HashSet::new();
     let mut example_snippet: Option<(String, String)> = None; // (path, first_line) for the few-shot example
     println!("{}", "Target files for context:".dimmed());
 
-    for (_, doc_address) in top_docs {
-        let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
-        let path = retrieved_doc
-            .get_first(file_path_field)
-            .unwrap()
-            .as_str()
-            .unwrap();
+    let merged_chunks = build_merged_context_chunks(
+        &top_docs,
+        &searcher,
+        file_path_field,
+        content_field,
+        start_line_field,
+        end_line_field,
+    )?;
 
-        // Skip duplicate hits for the same file.
-        if !seen_paths.insert(path.to_string()) {
-            continue;
-        }
-
-        let content = retrieved_doc
-            .get_first(content_field)
-            .unwrap()
-            .as_str()
-            .unwrap();
-
+    for chunk in &merged_chunks {
         if example_snippet.is_none() {
-            if let Some(first_line) = content.lines().find(|l| !l.trim().is_empty()) {
-                example_snippet = Some((path.to_string(), first_line.to_string()));
+            if let Some(first_line) = chunk.content.lines().find(|l| !l.trim().is_empty()) {
+                example_snippet = Some((chunk.path.clone(), first_line.to_string()));
             }
         }
 
-        println!("  • {}", path.bold().green());
-        context_payload.push_str(&format!("\n--- FILE: {} ---\n{}\n", path, content));
+        println!(
+            "  • {} (lines {}-{})",
+            chunk.path.bold().green(),
+            chunk.start_line,
+            chunk.end_line
+        );
+        context_payload.push_str(&format!(
+            "\n--- FILE: {} (lines {}-{}) ---\n{}\n",
+            chunk.path, chunk.start_line, chunk.end_line, chunk.content
+        ));
     }
 
     let client = reqwest::Client::new();
@@ -1201,12 +1199,122 @@ fn apply_edit_blocks(
     Ok(applied_count)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ContextChunk {
+    path: String,
+    start_line: u64,
+    end_line: u64,
+    content: String,
+}
+
+/// Builds merged context chunks from retrieved search documents by grouping by file_path,
+/// sorting by start_line, and merging contiguous or overlapping line ranges.
+fn build_merged_context_chunks(
+    top_docs: &[(tantivy::Score, tantivy::DocAddress)],
+    searcher: &tantivy::Searcher,
+    file_path_field: Field,
+    content_field: Field,
+    start_line_field: Field,
+    end_line_field: Field,
+) -> Result<Vec<ContextChunk>, Box<dyn std::error::Error>> {
+    let mut file_order = Vec::new();
+    let mut file_chunks: std::collections::HashMap<String, Vec<ContextChunk>> =
+        std::collections::HashMap::new();
+
+    for (_, doc_address) in top_docs {
+        let retrieved_doc: TantivyDocument = searcher.doc(*doc_address)?;
+        let path = retrieved_doc
+            .get_first(file_path_field)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let start = retrieved_doc
+            .get_first(start_line_field)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1);
+        let end = retrieved_doc
+            .get_first(end_line_field)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1);
+
+        let content = retrieved_doc
+            .get_first(content_field)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        if !file_chunks.contains_key(&path) {
+            file_order.push(path.clone());
+        }
+        file_chunks.entry(path.clone()).or_default().push(ContextChunk {
+            path,
+            start_line: start,
+            end_line: end,
+            content,
+        });
+    }
+
+    let mut merged_chunks = Vec::new();
+    for path in file_order {
+        if let Some(chunks) = file_chunks.remove(&path) {
+            merged_chunks.extend(merge_chunks(chunks));
+        }
+    }
+
+    Ok(merged_chunks)
+}
+
+/// Sorts chunks by start_line and merges contiguous or overlapping line ranges for a single file.
+fn merge_chunks(mut chunks: Vec<ContextChunk>) -> Vec<ContextChunk> {
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+
+    chunks.sort_by(|a, b| {
+        a.start_line
+            .cmp(&b.start_line)
+            .then_with(|| a.end_line.cmp(&b.end_line))
+    });
+
+    let mut merged: Vec<ContextChunk> = Vec::new();
+    for chunk in chunks {
+        if merged.is_empty() {
+            merged.push(chunk);
+        } else {
+            let last = merged.last_mut().unwrap();
+            if chunk.start_line <= last.end_line + 1 {
+                if chunk.end_line > last.end_line {
+                    let overlap = if last.end_line >= chunk.start_line {
+                        (last.end_line - chunk.start_line + 1) as usize
+                    } else {
+                        0
+                    };
+                    let new_lines: Vec<&str> = chunk.content.lines().skip(overlap).collect();
+                    if !new_lines.is_empty() {
+                        if !last.content.is_empty() {
+                            last.content.push('\n');
+                        }
+                        last.content.push_str(&new_lines.join("\n"));
+                    }
+                    last.end_line = chunk.end_line;
+                }
+            } else {
+                merged.push(chunk);
+            }
+        }
+    }
+    merged
+}
+
 /// Opens or builds the Tantivy search index for the target directory incrementally.
 fn ensure_index(
     target_directory: &str,
     reindex: bool,
     app_cache_dir: &std::path::Path,
-) -> Result<(Index, Field, Field), Box<dyn std::error::Error>> {
+) -> Result<(Index, Field, Field, Field, Field), Box<dyn std::error::Error>> {
     let target_path = fs::canonicalize(target_directory)
         .unwrap_or_else(|_| std::path::PathBuf::from(target_directory));
 
@@ -1239,6 +1347,8 @@ fn ensure_index(
     // TEXT field so file paths are tokenized and searchable by file name
     let file_path = schema_builder.add_text_field("path", TEXT | STORED);
     let content = schema_builder.add_text_field("content", TEXT | STORED);
+    let start_line = schema_builder.add_u64_field("start_line", INDEXED | STORED);
+    let end_line = schema_builder.add_u64_field("end_line", INDEXED | STORED);
     let schema = schema_builder.build();
 
     let dir = tantivy::directory::MmapDirectory::open(&index_path)?;
@@ -1266,10 +1376,16 @@ fn ensure_index(
                                 let file_content = String::from_utf8_lossy(&bytes).to_string();
                                 let path_term = Term::from_field_text(file_path, &path_str);
                                 index_writer.delete_term(path_term);
-                                index_writer.add_document(doc!(
-                                    file_path => path_str,
-                                    content => file_content
-                                ))?;
+
+                                let chunks = chunk_code(&file_content);
+                                for chunk in chunks {
+                                    index_writer.add_document(doc!(
+                                        file_path => path_str.clone(),
+                                        content => chunk.content,
+                                        start_line => chunk.start_line as u64,
+                                        end_line => chunk.end_line as u64
+                                    ))?;
+                                }
                             }
                         }
                     }
@@ -1281,7 +1397,105 @@ fn ensure_index(
     index_writer.commit()?;
     fs::write(state_file, current_run.to_string())?;
 
-    Ok((index, file_path, content))
+    Ok((index, file_path, content, start_line, end_line))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CodeChunk {
+    content: String,
+    start_line: usize,
+    end_line: usize,
+}
+
+/// Chunks a source file into fine-grained semantic blocks (functions, structs, impls, etc.)
+/// or line windows for fine-grained indexing, tracking line numbers.
+fn chunk_code(content: &str) -> Vec<CodeChunk> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return vec![CodeChunk {
+            content: String::new(),
+            start_line: 1,
+            end_line: 1,
+        }];
+    }
+
+    if lines.len() <= 35 {
+        return vec![CodeChunk {
+            content: content.to_string(),
+            start_line: 1,
+            end_line: lines.len(),
+        }];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current_chunk: Vec<&str> = Vec::new();
+    let mut chunk_start_line = 1;
+
+    for (idx, &line) in lines.iter().enumerate() {
+        let line_num = idx + 1;
+        let trimmed = line.trim();
+
+        let is_block_start = idx > 0
+            && (trimmed.starts_with("pub ")
+                || trimmed.starts_with("fn ")
+                || trimmed.starts_with("async fn ")
+                || trimmed.starts_with("struct ")
+                || trimmed.starts_with("enum ")
+                || trimmed.starts_with("impl ")
+                || trimmed.starts_with("class ")
+                || trimmed.starts_with("def ")
+                || trimmed.starts_with("function ")
+                || trimmed.starts_with("interface ")
+                || trimmed.starts_with("trait ")
+                || trimmed.starts_with("type ")
+                || trimmed.starts_with("//!")
+                || trimmed.starts_with("///")
+                || line.starts_with("#["));
+
+        if !current_chunk.is_empty()
+            && (current_chunk.len() >= 50 || (is_block_start && current_chunk.len() >= 5))
+        {
+            let chunk_str = current_chunk.join("\n");
+            if !chunk_str.trim().is_empty() {
+                let chunk_end_line = chunk_start_line + current_chunk.len() - 1;
+                chunks.push(CodeChunk {
+                    content: chunk_str,
+                    start_line: chunk_start_line,
+                    end_line: chunk_end_line,
+                });
+            }
+            current_chunk.clear();
+            chunk_start_line = line_num;
+        }
+
+        if current_chunk.is_empty() {
+            chunk_start_line = line_num;
+        }
+
+        current_chunk.push(line);
+    }
+
+    if !current_chunk.is_empty() {
+        let chunk_str = current_chunk.join("\n");
+        if !chunk_str.trim().is_empty() {
+            let chunk_end_line = chunk_start_line + current_chunk.len() - 1;
+            chunks.push(CodeChunk {
+                content: chunk_str,
+                start_line: chunk_start_line,
+                end_line: chunk_end_line,
+            });
+        }
+    }
+
+    if chunks.is_empty() {
+        vec![CodeChunk {
+            content: content.to_string(),
+            start_line: 1,
+            end_line: lines.len(),
+        }]
+    } else {
+        chunks
+    }
 }
 
 /// Checks whether a given file path should be indexed based on file extension and path exclusions.
@@ -1490,6 +1704,52 @@ mod tests {
         assert_eq!(blocks[0].search, "old line");
         assert_eq!(blocks[0].replace, "new line");
         assert_eq!(blocks[0].mode, EditMode::Replace);
+    }
+
+    #[test]
+    fn test_chunk_code() {
+        let short_code = "fn main() {\n    println!(\"hello\");\n}";
+        assert_eq!(chunk_code(short_code).len(), 1);
+
+        let long_code = (0..40)
+            .map(|i| format!("// Line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let chunks = chunk_code(&long_code);
+        assert!(chunks.len() >= 1);
+    }
+
+    #[test]
+    fn test_merge_chunks() {
+        let chunk1 = ContextChunk {
+            path: "file.rs".to_string(),
+            start_line: 1,
+            end_line: 3,
+            content: "line 1\nline 2\nline 3".to_string(),
+        };
+        let chunk2 = ContextChunk {
+            path: "file.rs".to_string(),
+            start_line: 3,
+            end_line: 5,
+            content: "line 3\nline 4\nline 5".to_string(),
+        };
+        let chunk3 = ContextChunk {
+            path: "file.rs".to_string(),
+            start_line: 10,
+            end_line: 12,
+            content: "line 10\nline 11\nline 12".to_string(),
+        };
+
+        let merged = merge_chunks(vec![chunk2, chunk1, chunk3]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].start_line, 1);
+        assert_eq!(merged[0].end_line, 5);
+        assert_eq!(
+            merged[0].content,
+            "line 1\nline 2\nline 3\nline 4\nline 5"
+        );
+        assert_eq!(merged[1].start_line, 10);
+        assert_eq!(merged[1].end_line, 12);
     }
 }
 
