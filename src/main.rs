@@ -977,52 +977,71 @@ async fn run_edit_pipeline(
     std::io::stdin().read_line(&mut input)?;
 
     if input.trim().eq_ignore_ascii_case("y") {
-        let outcome = run_verify_and_retry(
-            instruction,
-            3,
-            |current_instruction| {
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(generate_edit_writes(
-                        current_instruction,
-                        model,
-                        provider,
-                        target_dir,
-                        app_cache_dir,
-                    ))
-                })
-                .unwrap_or_default()
-            },
-            || cargo_check(target_dir),
-        )?;
+        let has_cargo_project = std::path::Path::new(target_dir).join("Cargo.toml").exists();
 
-        match outcome {
-            EditOutcome::Success { attempts } => {
-                println!(
+        if has_cargo_project {
+            let outcome = run_verify_and_retry(
+                instruction,
+                3, // max_attempts — worth a CLI flag, e.g. --max-attempts
+                |current_instruction| {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(generate_edit_writes(
+                            current_instruction,
+                            model,
+                            provider,
+                            target_dir,
+                            app_cache_dir,
+                        ))
+                    })
+                    .unwrap_or_default()
+                },
+                || cargo_check(target_dir),
+            )?;
+
+            match outcome {
+                EditOutcome::Success { attempts } => {
+                    println!(
+                        "{}",
+                        format!(" Edit applied and verified in {} attempt(s).", attempts)
+                            .green()
+                            .bold()
+                    );
+                }
+                EditOutcome::NoEditsGenerated => {
+                    println!("{}", "No valid edits could be generated.".yellow());
+                }
+                EditOutcome::ApplyFailed => {
+                    println!("{}", "Failed to write changes to disk.".red().bold());
+                }
+                EditOutcome::VerificationFailedAfterRetries {
+                    attempts,
+                    last_error,
+                } => {
+                    println!(
+                        "{}",
+                        format!(
+                            " Reverted after {} attempts — still fails to compile:\n{}",
+                            attempts, last_error
+                        )
+                        .red()
+                        .bold()
+                    );
+                }
+            }
+        } else {
+            let blocks: Vec<EditBlock> = valid_blocks.into_iter().map(|(b, _)| b).collect();
+            match apply_edit_blocks(&blocks, target_dir) {
+                Ok(count) => {
+                    println!(
                     "{}",
-                    format!(" Edit applied and verified in {} attempt(s).", attempts)
+                    format!(" Applied {} edit(s). No compile check available for this project type.", count)
                         .green()
                         .bold()
                 );
-            }
-            EditOutcome::NoEditsGenerated => {
-                println!("{}", "No valid edits could be generated.".yellow());
-            }
-            EditOutcome::ApplyFailed => {
-                println!("{}", "Failed to write changes to disk.".red().bold());
-            }
-            EditOutcome::VerificationFailedAfterRetries {
-                attempts,
-                last_error,
-            } => {
-                println!(
-                    "{}",
-                    format!(
-                        " Reverted after {} attempts — still fails to compile:\n{}",
-                        attempts, last_error
-                    )
-                    .red()
-                    .bold()
-                );
+                }
+                Err(e) => {
+                    println!("{}", format!("Failed to apply changes: {}", e).red().bold());
+                }
             }
         }
     } else {
