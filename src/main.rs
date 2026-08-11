@@ -3,16 +3,19 @@
 //! `cix` is a CLI tool providing fast indexed code search, codebase RAG question-answering (`cix ask`),
 //! and AI-driven automated code modification (`cix edit`).
 
+use cix::chunking::{CodeChunk, chunk_code};
 use clap::{Parser, Subcommand};
 use colored::*;
 use futures_util::StreamExt;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
-use cix::chunking::{chunk_code, CodeChunk};
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
@@ -52,6 +55,18 @@ struct Cli {
     /// Remove all cached indexes
     #[arg(long, default_value_t = false)]
     clean: bool,
+}
+
+struct CheckResult {
+    success: bool,
+    error_output: String,
+}
+
+enum EditOutcome {
+    Success { attempts: u32 },
+    NoEditsGenerated,
+    ApplyFailed,
+    VerificationFailedAfterRetries { attempts: u32, last_error: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -161,7 +176,6 @@ struct GeminiResponsePart {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // 1. Handle --clean flag
     let cache_dir = dirs::cache_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     let app_cache_dir = cache_dir.join("cix_indexes");
 
@@ -178,7 +192,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // 2. Handle 'cix ask' Subcommand
     if let Some(Commands::Ask {
         question,
         model,
@@ -190,7 +203,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // 3. Handle 'cix edit' Subcommand
     if let Some(Commands::Edit {
         instruction,
         model,
@@ -208,8 +220,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
         return Ok(());
     }
-
-    // 4. Fallback to standard search if no subcommand
     if let Some(query_str) = &cli.query {
         run_search_pipeline(
             query_str,
@@ -329,12 +339,18 @@ async fn run_ask_pipeline(
     let query_parser = QueryParser::for_index(&index, vec![file_path_field, content_field]);
     let query = parse_query_with_fuzzy(&query_parser, question);
 
-    let mut top_docs = searcher.search(&query, &TopDocs::with_limit(CANDIDATE_DOC_LIMIT).and_offset(0))?;
+    let mut top_docs = searcher.search(
+        &query,
+        &TopDocs::with_limit(CANDIDATE_DOC_LIMIT).and_offset(0),
+    )?;
 
     // Fallback: If generic question returns no hits, pull top indexed files
     if top_docs.is_empty() {
         if let Ok(fallback_query) = query_parser.parse_query("*") {
-            top_docs = searcher.search(&fallback_query, &TopDocs::with_limit(CANDIDATE_DOC_LIMIT).and_offset(0))?;
+            top_docs = searcher.search(
+                &fallback_query,
+                &TopDocs::with_limit(CANDIDATE_DOC_LIMIT).and_offset(0),
+            )?;
         }
     }
 
@@ -647,11 +663,17 @@ async fn run_edit_pipeline(
     let query_parser = QueryParser::for_index(&index, vec![file_path_field, content_field]);
     let query = parse_query_with_fuzzy(&query_parser, instruction);
 
-    let mut top_docs = searcher.search(&query, &TopDocs::with_limit(CANDIDATE_DOC_LIMIT).and_offset(0))?;
+    let mut top_docs = searcher.search(
+        &query,
+        &TopDocs::with_limit(CANDIDATE_DOC_LIMIT).and_offset(0),
+    )?;
 
     if top_docs.is_empty() {
         if let Ok(fallback_query) = query_parser.parse_query("*") {
-            top_docs = searcher.search(&fallback_query, &TopDocs::with_limit(CANDIDATE_DOC_LIMIT).and_offset(0))?;
+            top_docs = searcher.search(
+                &fallback_query,
+                &TopDocs::with_limit(CANDIDATE_DOC_LIMIT).and_offset(0),
+            )?;
         }
     }
 
@@ -955,31 +977,334 @@ async fn run_edit_pipeline(
     std::io::stdin().read_line(&mut input)?;
 
     if input.trim().eq_ignore_ascii_case("y") {
-        let blocks_only: Vec<EditBlock> = valid_blocks.into_iter().map(|(b, _)| b).collect();
-        let applied_count = apply_edit_blocks(&blocks_only, target_dir)?;
-        if applied_count > 0 {
-            println!(
-                "{}",
-                format!(
-                    " Successfully applied {} file modification(s)!",
-                    applied_count
-                )
-                .green()
-                .bold()
-            );
-        } else {
-            println!(
-                "{}",
-                " No modifications were applied due to missing files or search mismatches."
+        let outcome = run_verify_and_retry(
+            instruction,
+            3,
+            |current_instruction| {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(generate_edit_writes(
+                        current_instruction,
+                        model,
+                        provider,
+                        target_dir,
+                        app_cache_dir,
+                    ))
+                })
+                .unwrap_or_default()
+            },
+            || cargo_check(target_dir),
+        )?;
+
+        match outcome {
+            EditOutcome::Success { attempts } => {
+                println!(
+                    "{}",
+                    format!(" Edit applied and verified in {} attempt(s).", attempts)
+                        .green()
+                        .bold()
+                );
+            }
+            EditOutcome::NoEditsGenerated => {
+                println!("{}", "No valid edits could be generated.".yellow());
+            }
+            EditOutcome::ApplyFailed => {
+                println!("{}", "Failed to write changes to disk.".red().bold());
+            }
+            EditOutcome::VerificationFailedAfterRetries {
+                attempts,
+                last_error,
+            } => {
+                println!(
+                    "{}",
+                    format!(
+                        " Reverted after {} attempts — still fails to compile:\n{}",
+                        attempts, last_error
+                    )
                     .red()
                     .bold()
-            );
+                );
+            }
         }
     } else {
         println!("{}", "Operation canceled. No files were modified.".yellow());
     }
 
     Ok(())
+}
+
+/// Runs one retrieval + generation pass for `cix edit`, mirroring the logic
+/// in `run_edit_pipeline`, but instead of writing to disk it applies the
+/// resulting edit blocks to each target file's *current on-disk content* in
+/// memory and returns the resulting full file contents. This lets
+/// `run_verify_and_retry` own the actual `fs::write` + snapshot/restore
+/// cycle around verification, rather than this function touching disk itself.
+async fn generate_edit_writes(
+    instruction: &str,
+    model: &str,
+    provider: &str,
+    target_dir: &str,
+    app_cache_dir: &std::path::Path,
+) -> Result<Vec<(PathBuf, String)>, Box<dyn std::error::Error>> {
+    let (index, file_path_field, content_field, start_line_field, end_line_field) =
+        ensure_index(target_dir, false, app_cache_dir)?;
+    let reader = index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::OnCommitWithDelay)
+        .try_into()?;
+    let searcher = reader.searcher();
+
+    let query_parser = QueryParser::for_index(&index, vec![file_path_field, content_field]);
+    let query = parse_query_with_fuzzy(&query_parser, instruction);
+
+    let mut top_docs = searcher.search(
+        &query,
+        &TopDocs::with_limit(CANDIDATE_DOC_LIMIT).and_offset(0),
+    )?;
+    if top_docs.is_empty() {
+        if let Ok(fallback_query) = query_parser.parse_query("*") {
+            top_docs = searcher.search(
+                &fallback_query,
+                &TopDocs::with_limit(CANDIDATE_DOC_LIMIT).and_offset(0),
+            )?;
+        }
+    }
+    if top_docs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let merged_chunks = build_merged_context_chunks(
+        &top_docs,
+        &searcher,
+        file_path_field,
+        content_field,
+        start_line_field,
+        end_line_field,
+    )?;
+    let merged_chunks = take_chunks_within_budget(merged_chunks, CONTEXT_CHAR_BUDGET);
+
+    let mut context_payload = String::new();
+    let mut example_snippet: Option<(String, String)> = None;
+    for chunk in &merged_chunks {
+        if example_snippet.is_none() {
+            if let Some(first_line) = chunk.content.lines().find(|l| !l.trim().is_empty()) {
+                example_snippet = Some((chunk.path.clone(), first_line.to_string()));
+            }
+        }
+        context_payload.push_str(&format!(
+            "\n--- FILE: {} (lines {}-{}) ---\n{}\n",
+            chunk.path, chunk.start_line, chunk.end_line, chunk.content
+        ));
+    }
+
+    let client = reqwest::Client::new();
+    let use_gemini = match provider.to_lowercase().as_str() {
+        "gemini" => true,
+        "ollama" | "local" => false,
+        _ => model.to_lowercase().contains("gemini"),
+    };
+
+    // Same two prompt shapes as the initial pass in run_edit_pipeline: Gemini
+    // gets the marker-format instructions, Ollama gets the schema-backed
+    // field descriptions (its output shape is already guaranteed by `format`).
+    let prompt = if use_gemini {
+        let format_example = match &example_snippet {
+            Some((path, line)) => format!(
+                "Example (format only — base the SEARCH text on lines that actually \
+                appear in the codebase context below, not on this example):\n\
+                FILE: {}\n\
+                <<<<<<< SEARCH\n{}\n=======\n{}\n>>>>>>> REPLACE\n",
+                path, line, line
+            ),
+            None => String::from(
+                "Example (format only):\n\
+                FILE: path/to/file.ext\n\
+                <<<<<<< SEARCH\nexact code lines to match and replace\n=======\n\
+                new code lines to insert\n>>>>>>> REPLACE\n",
+            ),
+        };
+
+        format!(
+            "You are an AI coding agent modifying source code.\n\
+            Perform the requested edit strictly using SEARCH/REPLACE blocks formatted exactly as follows:\n\n\
+            {}\n\
+            Rules:\n\
+            1. Keep SEARCH blocks small and unique so they match accurately.\n\
+            2. Preserve exact indentation.\n\
+            3. The SEARCH text must be copied verbatim from the CODEBASE CONTEXT below — never invent or paraphrase it.\n\
+            4. Do not output conversational text or markdown code fences outside of the block structure.\n\n\
+            CODEBASE CONTEXT:\n{}\n\nINSTRUCTION:\n{}\n",
+            format_example, context_payload, instruction
+        )
+    } else {
+        let anchor_example = match &example_snippet {
+            Some((path, line)) => format!(
+                "\nExample of adding NEW content at the end of a file:\n\
+                {{\"file_path\": \"{}\", \"mode\": \"append\", \"search\": \"\", \"replace\": \"<new content goes here>\"}}\n\
+                (append mode adds `replace` to the end of the file — no anchor needed)\n\n\
+                Example of changing EXISTING content (format only — base the real search on a line \
+                that actually appears in the codebase context below, not on this example):\n\
+                {{\"file_path\": \"{}\", \"mode\": \"replace\", \"search\": \"{}\", \"replace\": \"<updated line>\"}}\n",
+                path, path, line
+            ),
+            None => String::new(),
+        };
+
+        format!(
+            "You are an AI coding agent modifying source code.\n\
+            For each change needed, provide:\n\
+            - file_path: the exact path as it appears in CODEBASE CONTEXT below\n\
+            - mode: either \"replace\" (change existing text) or \"append\" (add new text to the end of the file)\n\
+            - search: for mode \"replace\", text copied verbatim from that file's content — never invent, \
+              paraphrase, or reformat it. For mode \"append\", leave this as an empty string.\n\
+            - replace: for mode \"replace\", the new text that replaces search. For mode \"append\", the \
+              new content to add at the end of the file.\n\n\
+            Keep each search value small and unique enough to match exactly once. Preserve exact indentation.\n\n\
+            IMPORTANT: If the instruction asks to ADD new content (e.g. a new section, a new line, \
+            \"at the bottom\", \"at the end\"), use mode \"append\" rather than forcing it through replace.\n{}\n\
+            CODEBASE CONTEXT:\n{}\n\nINSTRUCTION:\n{}\n",
+            anchor_example, context_payload, instruction
+        )
+    };
+
+    let response_text = if use_gemini {
+        let api_key = std::env::var("GEMINI_API_KEY")
+            .map_err(|_| "GEMINI_API_KEY environment variable not set.")?;
+        let model_name = model.trim_start_matches("models/");
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            model_name, api_key
+        );
+        let body = GeminiRequest {
+            contents: vec![GeminiContent {
+                parts: vec![GeminiPart { text: prompt }],
+            }],
+        };
+        let res = client.post(&url).json(&body).send().await?;
+        if res.status().is_success() {
+            let gemini_res: GeminiResponse = res.json().await?;
+            gemini_res
+                .candidates
+                .and_then(|c| c.first().cloned())
+                .and_then(|c| c.content.parts.first().cloned())
+                .map(|p| p.text)
+                .unwrap_or_default()
+        } else {
+            return Err(format!("Gemini API Error: {}", res.text().await?).into());
+        }
+    } else {
+        let res = client
+            .post("http://localhost:11434/api/generate")
+            .json(&OllamaRequest {
+                model: model.to_string(),
+                prompt,
+                stream: false,
+                format: Some(edit_blocks_schema()),
+            })
+            .send()
+            .await?;
+        let ollama_res: OllamaResponse = res.json().await?;
+        ollama_res.response
+    };
+
+    let edit_blocks = if use_gemini {
+        parse_edit_blocks(&response_text)
+    } else {
+        parse_edit_blocks_json(&response_text)
+    };
+
+    if edit_blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Same pre-validation as the initial pass: drop blocks whose file can't
+    // be resolved/read, or whose Replace SEARCH text isn't found on disk.
+    let mut valid_blocks: Vec<(EditBlock, PathBuf)> = Vec::new();
+    for block in edit_blocks {
+        let resolved = match resolve_file_path(&block.file_path, target_dir) {
+            Some(p) => p,
+            None => continue,
+        };
+        let content = match fs::read_to_string(&resolved) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if block.mode == EditMode::Replace {
+            let normalized_content = content.replace("\r\n", "\n");
+            let normalized_search = block.search.replace("\r\n", "\n");
+            if !normalized_content.contains(&normalized_search) {
+                continue;
+            }
+        }
+        valid_blocks.push((block, resolved));
+    }
+
+    if valid_blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Apply every valid block in memory, grouped by file, so multiple blocks
+    // targeting the same file compose on top of each other instead of each
+    // one starting fresh from the on-disk original.
+    let mut working: HashMap<PathBuf, String> = HashMap::new();
+    let mut order: Vec<PathBuf> = Vec::new();
+
+    for (block, resolved) in &valid_blocks {
+        if !working.contains_key(resolved) {
+            working.insert(resolved.clone(), fs::read_to_string(resolved)?);
+            order.push(resolved.clone());
+        }
+        let current = working.get_mut(resolved).unwrap();
+
+        match block.mode {
+            EditMode::Replace => {
+                let normalized_content = current.replace("\r\n", "\n");
+                let normalized_search = block.search.replace("\r\n", "\n");
+                let normalized_replace = block.replace.replace("\r\n", "\n");
+
+                // A prior block against this same file may already have
+                // changed the text this one expected to find — skip rather
+                // than corrupt the file with a no-op or partial match.
+                if !normalized_content.contains(&normalized_search) {
+                    continue;
+                }
+
+                let new_content =
+                    normalized_content.replacen(&normalized_search, &normalized_replace, 1);
+                *current = if current.contains("\r\n") {
+                    new_content.replace('\n', "\r\n")
+                } else {
+                    new_content
+                };
+            }
+            EditMode::Append => {
+                let normalized_replace = block.replace.replace("\r\n", "\n");
+                let separator = if current.is_empty() || current.ends_with('\n') {
+                    ""
+                } else {
+                    "\n"
+                };
+                let new_content = format!(
+                    "{}{}{}\n",
+                    current.replace("\r\n", "\n"),
+                    separator,
+                    normalized_replace
+                );
+                *current = if current.contains("\r\n") {
+                    new_content.replace('\n', "\r\n")
+                } else {
+                    new_content
+                };
+            }
+        }
+    }
+
+    Ok(order
+        .into_iter()
+        .map(|path| {
+            let content = working.remove(&path).unwrap();
+            (path, content)
+        })
+        .collect())
 }
 
 /// Parses marker-format SEARCH/REPLACE blocks from a text response (Gemini path).
@@ -1296,12 +1621,15 @@ fn build_merged_context_chunks(
         if !file_chunks.contains_key(&path) {
             file_order.push(path.clone());
         }
-        file_chunks.entry(path.clone()).or_default().push(ContextChunk {
-            path,
-            start_line: start,
-            end_line: end,
-            content,
-        });
+        file_chunks
+            .entry(path.clone())
+            .or_default()
+            .push(ContextChunk {
+                path,
+                start_line: start,
+                end_line: end,
+                content,
+            });
     }
 
     let mut merged_chunks = Vec::new();
@@ -1391,7 +1719,6 @@ fn ensure_index(
     let current_run = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
     let mut schema_builder = Schema::builder();
-    // TEXT field so file paths are tokenized and searchable by file name
     let file_path = schema_builder.add_text_field("path", TEXT | STORED);
     let content = schema_builder.add_text_field("content", TEXT | STORED);
     let start_line = schema_builder.add_u64_field("start_line", INDEXED | STORED);
@@ -1418,7 +1745,6 @@ fn ensure_index(
                         let modified_secs = modified_time.duration_since(UNIX_EPOCH)?.as_secs();
 
                         if modified_secs >= last_run {
-                            // Lossy reading to support files with non-UTF8 encodings
                             if let Ok(bytes) = fs::read(entry.path()) {
                                 let file_content = String::from_utf8_lossy(&bytes).to_string();
                                 let path_term = Term::from_field_text(file_path, &path_str);
@@ -1611,6 +1937,101 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
     dp[len_a][len_b]
 }
 
+fn run_verify_and_retry<G, V>(
+    initial_instruction: &str,
+    max_attempts: u32,
+    mut generate: G,
+    mut verify: V,
+) -> std::io::Result<EditOutcome>
+where
+    G: FnMut(&str) -> Vec<(PathBuf, String)>,
+    V: FnMut() -> CheckResult,
+{
+    let mut instruction = initial_instruction.to_string();
+    let mut attempt = 0u32;
+
+    loop {
+        attempt += 1;
+        let writes = generate(&instruction);
+        if writes.is_empty() {
+            return Ok(EditOutcome::NoEditsGenerated);
+        }
+
+        let paths: Vec<PathBuf> = writes.iter().map(|(p, _)| p.clone()).collect();
+        let backups = match snapshot_files(&paths) {
+            Ok(b) => b,
+            Err(_) => return Ok(EditOutcome::ApplyFailed),
+        };
+
+        for (path, content) in &writes {
+            if fs::write(path, content).is_err() {
+                let _ = restore_files(&backups);
+                return Ok(EditOutcome::ApplyFailed);
+            }
+        }
+
+        let check = verify();
+        if check.success {
+            return Ok(EditOutcome::Success { attempts: attempt });
+        }
+        if attempt >= max_attempts {
+            let _ = restore_files(&backups);
+            return Ok(EditOutcome::VerificationFailedAfterRetries {
+                attempts: attempt,
+                last_error: check.error_output,
+            });
+        }
+
+        let _ = restore_files(&backups);
+        instruction = format!(
+            "The previous attempt to '{}' produced this compiler error:\n{}\n\
+            Fix the instruction's intent while resolving this error.",
+            initial_instruction, check.error_output
+        );
+    }
+}
+
+fn cargo_check(target_dir: &str) -> CheckResult {
+    match Command::new("cargo")
+        .arg("check")
+        .arg("--message-format=short")
+        .current_dir(target_dir)
+        .output()
+    {
+        Ok(output) if output.status.success() => CheckResult {
+            success: true,
+            error_output: String::new(),
+        },
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let truncated: String = stderr.lines().take(30).collect::<Vec<_>>().join("\n");
+            CheckResult {
+                success: false,
+                error_output: truncated,
+            }
+        }
+        Err(e) => CheckResult {
+            success: false,
+            error_output: format!("Failed to run `cargo check`: {e}. Is `cargo` on PATH?"),
+        },
+    }
+}
+
+fn snapshot_files(paths: &[PathBuf]) -> std::io::Result<HashMap<PathBuf, String>> {
+    let mut backups = HashMap::new();
+    for path in paths {
+        backups.insert(path.clone(), fs::read_to_string(path)?);
+    }
+    Ok(backups)
+}
+
+fn restore_files(backups: &HashMap<PathBuf, String>) -> std::io::Result<()> {
+    for (path, content) in backups {
+        fs::write(path, content)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1698,10 +2119,7 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].start_line, 1);
         assert_eq!(merged[0].end_line, 5);
-        assert_eq!(
-            merged[0].content,
-            "line 1\nline 2\nline 3\nline 4\nline 5"
-        );
+        assert_eq!(merged[0].content, "line 1\nline 2\nline 3\nline 4\nline 5");
         assert_eq!(merged[1].start_line, 10);
         assert_eq!(merged[1].end_line, 12);
     }

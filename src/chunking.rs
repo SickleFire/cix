@@ -125,7 +125,9 @@ fn chunk_rust(content: &str) -> Option<Vec<CodeChunk>> {
         }
 
         if is_item_node(kind) {
-            let start_byte = pending_trivia_start.take().unwrap_or_else(|| node.start_byte());
+            let start_byte = pending_trivia_start
+                .take()
+                .unwrap_or_else(|| node.start_byte());
             let end_byte = node.end_byte();
             push_item_chunk(content, node, start_byte, end_byte, &mut chunks);
         } else {
@@ -219,7 +221,9 @@ fn split_container_by_inner_items(source: &str, node: Node, chunks: &mut Vec<Cod
             continue;
         }
 
-        let start_byte = pending_trivia_start.take().unwrap_or_else(|| member.start_byte());
+        let start_byte = pending_trivia_start
+            .take()
+            .unwrap_or_else(|| member.start_byte());
         let end_byte = member.end_byte();
         let member_text = &source[start_byte..end_byte];
 
@@ -244,7 +248,12 @@ fn find_body_start(node: Node, _source: &str) -> Option<usize> {
     node.child_by_field_name("body").map(|b| b.start_byte())
 }
 
-fn emit_chunk_from_bytes(source: &str, start_byte: usize, end_byte: usize, chunks: &mut Vec<CodeChunk>) {
+fn emit_chunk_from_bytes(
+    source: &str,
+    start_byte: usize,
+    end_byte: usize,
+    chunks: &mut Vec<CodeChunk>,
+) {
     if start_byte >= end_byte {
         return;
     }
@@ -262,7 +271,10 @@ fn emit_chunk_from_bytes(source: &str, start_byte: usize, end_byte: usize, chunk
 }
 
 fn byte_to_line(source: &str, byte_offset: usize) -> usize {
-    source[..byte_offset.min(source.len())].matches('\n').count() + 1
+    source[..byte_offset.min(source.len())]
+        .matches('\n')
+        .count()
+        + 1
 }
 
 /// Splits an oversized standalone item's text (a single huge function,
@@ -361,9 +373,25 @@ fn chunk_generic_fallback(content: &str) -> Vec<CodeChunk> {
     }
 
     let boundary_keywords = [
-        "pub ", "fn ", "async fn ", "struct ", "enum ", "impl ", "class ", "def ", "function ",
-        "interface ", "trait ", "type ", "namespace ", "mod ", "match ", "public ", "private ",
-        "protected ", "static ",
+        "pub ",
+        "fn ",
+        "async fn ",
+        "struct ",
+        "enum ",
+        "impl ",
+        "class ",
+        "def ",
+        "function ",
+        "interface ",
+        "trait ",
+        "type ",
+        "namespace ",
+        "mod ",
+        "match ",
+        "public ",
+        "private ",
+        "protected ",
+        "static ",
     ];
     let comment_prefixes = ["//", "#", "/*", "*", "'''", "\"\"\""];
 
@@ -440,7 +468,12 @@ fn chunk_generic_fallback(content: &str) -> Vec<CodeChunk> {
 
 /// Looks backward from `hint_idx` for a low-depth closing brace or a blank
 /// line to use as a clean split point, instead of cutting mid-statement.
-fn find_soft_break(lines: &[&str], chunk_start: usize, hint_idx: usize, depth_at_hint: i64) -> usize {
+fn find_soft_break(
+    lines: &[&str],
+    chunk_start: usize,
+    hint_idx: usize,
+    depth_at_hint: i64,
+) -> usize {
     let search_start = chunk_start.max(hint_idx.saturating_sub(15));
     for j in (search_start..=hint_idx).rev() {
         let trimmed = lines[j].trim();
@@ -454,7 +487,12 @@ fn find_soft_break(lines: &[&str], chunk_start: usize, hint_idx: usize, depth_at
     hint_idx
 }
 
-fn push_fallback_chunk(lines: &[&str], start_idx: usize, end_idx: usize, chunks: &mut Vec<CodeChunk>) {
+fn push_fallback_chunk(
+    lines: &[&str],
+    start_idx: usize,
+    end_idx: usize,
+    chunks: &mut Vec<CodeChunk>,
+) {
     if start_idx > end_idx {
         return;
     }
@@ -543,7 +581,10 @@ impl Foo {
         body.push_str("}\n");
 
         let chunks = chunk_rust(&body).expect("should parse");
-        assert!(chunks.len() > 1, "oversized impl should split into multiple chunks");
+        assert!(
+            chunks.len() > 1,
+            "oversized impl should split into multiple chunks"
+        );
         assert!(chunks.iter().all(|c| c.content.contains("impl Widget")));
     }
 }
