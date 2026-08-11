@@ -8,7 +8,7 @@ use colored::*;
 use futures_util::StreamExt;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use cix::chunking::{chunk_code, CodeChunk};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -263,6 +263,49 @@ fn extract_keywords(question: &str) -> String {
     }
 }
 
+/// Max total characters of code context assembled into a single RAG/edit
+/// prompt. Rough proxy for token budget (roughly 3-4 chars/token for code),
+/// chosen to leave headroom under typical local-model context windows once
+/// the instruction, formatting, and system prompt text are added on top.
+const CONTEXT_CHAR_BUDGET: usize = 12_000;
+
+/// How many candidate chunks to pull from Tantivy before truncating by
+/// budget. Kept generous since Tantivy search itself is cheap — the real
+/// cost is prompt size, which the budget below controls directly.
+const CANDIDATE_DOC_LIMIT: usize = 20;
+
+/// Selects a prefix of `chunks` (already ranked by relevance/merge order)
+/// whose combined formatted size stays within `budget` characters. Always
+/// includes at least the first chunk, even if it alone exceeds the budget,
+/// so a single large but highly relevant match is never dropped to zero
+/// context.
+fn take_chunks_within_budget(chunks: Vec<ContextChunk>, budget: usize) -> Vec<ContextChunk> {
+    let mut selected = Vec::new();
+    let mut running_len = 0usize;
+
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        // Mirrors the "--- FILE: {} (lines {}-{}) ---\n" formatting overhead
+        // added when building context_payload, so the budget reflects what
+        // actually lands in the prompt, not just raw chunk.content length.
+        let formatted_len = chunk.content.len() + chunk.path.len() + 40;
+
+        if i == 0 {
+            selected.push(chunk);
+            running_len += formatted_len;
+            continue;
+        }
+
+        if running_len + formatted_len > budget {
+            break;
+        }
+
+        running_len += formatted_len;
+        selected.push(chunk);
+    }
+
+    selected
+}
+
 /// Executes the RAG question-answering pipeline: retrieves relevant file contexts
 /// from the index and queries Gemini API (or local Ollama as fallback).
 async fn run_ask_pipeline(
@@ -286,12 +329,12 @@ async fn run_ask_pipeline(
     let query_parser = QueryParser::for_index(&index, vec![file_path_field, content_field]);
     let query = parse_query_with_fuzzy(&query_parser, question);
 
-    let mut top_docs = searcher.search(&query, &TopDocs::with_limit(4).and_offset(0))?;
+    let mut top_docs = searcher.search(&query, &TopDocs::with_limit(CANDIDATE_DOC_LIMIT).and_offset(0))?;
 
     // Fallback: If generic question returns no hits, pull top indexed files
     if top_docs.is_empty() {
         if let Ok(fallback_query) = query_parser.parse_query("*") {
-            top_docs = searcher.search(&fallback_query, &TopDocs::with_limit(4).and_offset(0))?;
+            top_docs = searcher.search(&fallback_query, &TopDocs::with_limit(CANDIDATE_DOC_LIMIT).and_offset(0))?;
         }
     }
 
@@ -311,6 +354,8 @@ async fn run_ask_pipeline(
         start_line_field,
         end_line_field,
     )?;
+
+    let merged_chunks = take_chunks_within_budget(merged_chunks, CONTEXT_CHAR_BUDGET);
 
     for chunk in &merged_chunks {
         println!(
@@ -602,11 +647,11 @@ async fn run_edit_pipeline(
     let query_parser = QueryParser::for_index(&index, vec![file_path_field, content_field]);
     let query = parse_query_with_fuzzy(&query_parser, instruction);
 
-    let mut top_docs = searcher.search(&query, &TopDocs::with_limit(3).and_offset(0))?;
+    let mut top_docs = searcher.search(&query, &TopDocs::with_limit(CANDIDATE_DOC_LIMIT).and_offset(0))?;
 
     if top_docs.is_empty() {
         if let Ok(fallback_query) = query_parser.parse_query("*") {
-            top_docs = searcher.search(&fallback_query, &TopDocs::with_limit(3).and_offset(0))?;
+            top_docs = searcher.search(&fallback_query, &TopDocs::with_limit(CANDIDATE_DOC_LIMIT).and_offset(0))?;
         }
     }
 
@@ -627,6 +672,8 @@ async fn run_edit_pipeline(
         start_line_field,
         end_line_field,
     )?;
+
+    let merged_chunks = take_chunks_within_budget(merged_chunks, CONTEXT_CHAR_BUDGET);
 
     for chunk in &merged_chunks {
         if example_snippet.is_none() {
@@ -1377,7 +1424,12 @@ fn ensure_index(
                                 let path_term = Term::from_field_text(file_path, &path_str);
                                 index_writer.delete_term(path_term);
 
-                                let chunks = chunk_code(&file_content);
+                                let ext = std::path::Path::new(&path_str)
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    .unwrap_or("");
+
+                                let chunks = chunk_code(&file_content, ext);
                                 for chunk in chunks {
                                     index_writer.add_document(doc!(
                                         file_path => path_str.clone(),
@@ -1398,104 +1450,6 @@ fn ensure_index(
     fs::write(state_file, current_run.to_string())?;
 
     Ok((index, file_path, content, start_line, end_line))
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct CodeChunk {
-    content: String,
-    start_line: usize,
-    end_line: usize,
-}
-
-/// Chunks a source file into fine-grained semantic blocks (functions, structs, impls, etc.)
-/// or line windows for fine-grained indexing, tracking line numbers.
-fn chunk_code(content: &str) -> Vec<CodeChunk> {
-    let lines: Vec<&str> = content.lines().collect();
-    if lines.is_empty() {
-        return vec![CodeChunk {
-            content: String::new(),
-            start_line: 1,
-            end_line: 1,
-        }];
-    }
-
-    if lines.len() <= 35 {
-        return vec![CodeChunk {
-            content: content.to_string(),
-            start_line: 1,
-            end_line: lines.len(),
-        }];
-    }
-
-    let mut chunks = Vec::new();
-    let mut current_chunk: Vec<&str> = Vec::new();
-    let mut chunk_start_line = 1;
-
-    for (idx, &line) in lines.iter().enumerate() {
-        let line_num = idx + 1;
-        let trimmed = line.trim();
-
-        let is_block_start = idx > 0
-            && (trimmed.starts_with("pub ")
-                || trimmed.starts_with("fn ")
-                || trimmed.starts_with("async fn ")
-                || trimmed.starts_with("struct ")
-                || trimmed.starts_with("enum ")
-                || trimmed.starts_with("impl ")
-                || trimmed.starts_with("class ")
-                || trimmed.starts_with("def ")
-                || trimmed.starts_with("function ")
-                || trimmed.starts_with("interface ")
-                || trimmed.starts_with("trait ")
-                || trimmed.starts_with("type ")
-                || trimmed.starts_with("//!")
-                || trimmed.starts_with("///")
-                || line.starts_with("#["));
-
-        if !current_chunk.is_empty()
-            && (current_chunk.len() >= 50 || (is_block_start && current_chunk.len() >= 5))
-        {
-            let chunk_str = current_chunk.join("\n");
-            if !chunk_str.trim().is_empty() {
-                let chunk_end_line = chunk_start_line + current_chunk.len() - 1;
-                chunks.push(CodeChunk {
-                    content: chunk_str,
-                    start_line: chunk_start_line,
-                    end_line: chunk_end_line,
-                });
-            }
-            current_chunk.clear();
-            chunk_start_line = line_num;
-        }
-
-        if current_chunk.is_empty() {
-            chunk_start_line = line_num;
-        }
-
-        current_chunk.push(line);
-    }
-
-    if !current_chunk.is_empty() {
-        let chunk_str = current_chunk.join("\n");
-        if !chunk_str.trim().is_empty() {
-            let chunk_end_line = chunk_start_line + current_chunk.len() - 1;
-            chunks.push(CodeChunk {
-                content: chunk_str,
-                start_line: chunk_start_line,
-                end_line: chunk_end_line,
-            });
-        }
-    }
-
-    if chunks.is_empty() {
-        vec![CodeChunk {
-            content: content.to_string(),
-            start_line: 1,
-            end_line: lines.len(),
-        }]
-    } else {
-        chunks
-    }
 }
 
 /// Checks whether a given file path should be indexed based on file extension and path exclusions.
