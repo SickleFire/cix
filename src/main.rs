@@ -8,8 +8,8 @@ use colored::*;
 use futures_util::StreamExt;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
@@ -512,7 +512,10 @@ fn run_search_pipeline(
             .enumerate()
             .filter_map(|(idx, line): (usize, &&str)| {
                 let line_lower = line.to_lowercase();
-                if keywords.iter().any(|kw| line_matches_keyword(&line_lower, kw)) {
+                if keywords
+                    .iter()
+                    .any(|kw| line_matches_keyword(&line_lower, kw))
+                {
                     Some(idx)
                 } else {
                     None
@@ -571,7 +574,7 @@ struct EditBlock {
     replace: String,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 enum EditMode {
     Replace,
     Append,
@@ -821,11 +824,7 @@ async fn run_edit_pipeline(
             None => {
                 eprintln!(
                     "{}",
-                    format!(
-                        " Skipping block: file not found: {}",
-                        block.file_path
-                    )
-                    .yellow()
+                    format!(" Skipping block: file not found: {}", block.file_path).yellow()
                 );
                 continue;
             }
@@ -1385,7 +1384,13 @@ fn is_fuzzy_match(keyword: &str, word: &str) -> bool {
         return true;
     }
 
-    let max_dist = if kw_len <= 3 { 0 } else if kw_len <= 6 { 1 } else { 2 };
+    let max_dist = if kw_len <= 3 {
+        0
+    } else if kw_len <= 6 {
+        1
+    } else {
+        2
+    };
     let len_diff = if kw_len > w_len {
         kw_len - w_len
     } else {
@@ -1438,6 +1443,56 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
     dp[len_a][len_b]
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_keywords() {
+        let question = "how does extract_keywords work in main.rs?";
+        let keywords = extract_keywords(question);
+        assert!(keywords.contains("extract_keywords"));
+        assert!(!keywords.contains("how"));
+        assert!(!keywords.contains("does"));
+        assert!(!keywords.contains("main.rs"));
+    }
+
+    #[test]
+    fn test_levenshtein_distance() {
+        assert_eq!(levenshtein_distance("kitten", "sitting"), 3);
+        assert_eq!(levenshtein_distance("flaw", "lawn"), 2);
+        assert_eq!(levenshtein_distance("test", "test"), 0);
+    }
+
+    #[test]
+    fn test_is_fuzzy_match() {
+        assert!(is_fuzzy_match("search", "search"));
+        assert!(is_fuzzy_match("search", "seach")); // 1 typo
+        assert!(!is_fuzzy_match("search", "completelydifferent"));
+    }
+
+    #[test]
+    fn test_is_indexable_file() {
+        assert!(is_indexable_file("src/main.rs"));
+        assert!(is_indexable_file("script.py"));
+        assert!(!is_indexable_file("node_modules/package/index.js"));
+        assert!(!is_indexable_file(".git/config"));
+        assert!(!is_indexable_file("archive.zip"));
+    }
+
+    #[test]
+    fn test_parse_edit_blocks() {
+        let raw =
+            "FILE: src/test.rs\n<<<<<<< SEARCH\nold line\n=======\nnew line\n>>>>>>> REPLACE\n";
+        let blocks = parse_edit_blocks(raw);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].file_path, "src/test.rs");
+        assert_eq!(blocks[0].search, "old line");
+        assert_eq!(blocks[0].replace, "new line");
+        assert_eq!(blocks[0].mode, EditMode::Replace);
+    }
+}
+
 /// Highlights search query keyword matches (including fuzzy matches) in a code line using ANSI color formatting.
 fn highlight_match(line: &str, query: &str) -> String {
     let keywords: Vec<String> = extract_keywords(query)
@@ -1461,7 +1516,10 @@ fn highlight_match(line: &str, query: &str) -> String {
             if !current_token.is_empty() {
                 if is_alphanumeric_mode {
                     let token_lower = current_token.to_lowercase();
-                    if keywords.iter().any(|kw| line_matches_keyword(&token_lower, kw)) {
+                    if keywords
+                        .iter()
+                        .any(|kw| line_matches_keyword(&token_lower, kw))
+                    {
                         result.push_str(&current_token.bold().red().to_string());
                     } else {
                         result.push_str(&current_token);
@@ -1479,7 +1537,10 @@ fn highlight_match(line: &str, query: &str) -> String {
     if !current_token.is_empty() {
         if is_alphanumeric_mode {
             let token_lower = current_token.to_lowercase();
-            if keywords.iter().any(|kw| line_matches_keyword(&token_lower, kw)) {
+            if keywords
+                .iter()
+                .any(|kw| line_matches_keyword(&token_lower, kw))
+            {
                 result.push_str(&current_token.bold().red().to_string());
             } else {
                 result.push_str(&current_token);
