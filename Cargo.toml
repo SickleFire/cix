@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 tree-sitter = "0.24"
 tree-sitter-rust = "0.23"
+tree-sitter-c-sharp = "0.21"
+tree-sitter-cpp = "0.22"
 tantivy = "0.22"
 colored = "2.1"
 ignore = "0.4"

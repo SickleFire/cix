@@ -1,23 +1,4 @@
 //! Semantic code chunking for `cix`.
-//!
-//! Replaces the old string-prefix-matching `chunk_code` with:
-//! - Real AST-based chunking for Rust via `tree-sitter`, so boundaries land on
-//!   actual item nodes (fn/struct/enum/impl/trait/mod) instead of guessed
-//!   keyword prefixes, and nested items (methods inside `impl`) are never
-//!   confused with top-level ones.
-//! - Doc comments and attributes (`///`, `//!`, `#[...]`) are attached to the
-//!   item they document instead of being treated as their own boundary.
-//! - Oversized items (a huge `impl` block, a huge single function) are split
-//!   further without cutting mid-statement, using brace-depth-aware soft
-//!   splitting instead of a blind line-count cutoff.
-//! - A brace/indent-aware fallback chunker handles every other language,
-//!   replacing the old flat 50-line window with something structure-aware.
-//! - Adjacent chunks get a small line overlap so a semantic unit split across
-//!   a boundary still scores well in pre-merge retrieval.
-//! - Size limits are measured in characters (a proxy for tokens), not raw
-//!   line counts, so dense code and minified/data files are treated fairly.
-//!
-//! ```
 
 use tree_sitter::{Node, Parser};
 
@@ -55,17 +36,18 @@ pub fn chunk_code(content: &str, file_ext: &str) -> Vec<CodeChunk> {
 
     let chunks = match file_ext.to_lowercase().as_str() {
         "rs" => chunk_rust(content),
+        "cs" => chunk_c_sharp(content),
+        // C/C++ extensions (source + headers)
+        "c" | "cpp" | "cc" | "cxx" | "c++" | "h" | "hpp" | "hh" | "h++" | "hxx" => {
+            chunk_cpp(content)
+        }
         _ => None,
     };
 
     chunks.unwrap_or_else(|| chunk_generic_fallback(content))
 }
 
-// ---------------------------------------------------------------------
-// Rust: tree-sitter based chunking
-// ---------------------------------------------------------------------
 
-/// Node kinds that count as a top-level "item" worth its own chunk.
 fn is_item_node(kind: &str) -> bool {
     matches!(
         kind,
@@ -83,11 +65,360 @@ fn is_item_node(kind: &str) -> bool {
     )
 }
 
-/// Node kinds treated as "leading trivia" that should be glued to the next
-/// item node rather than split off on their own (doc comments, attributes,
-/// plain comments sitting directly above a declaration).
 fn is_leading_trivia(kind: &str) -> bool {
     matches!(kind, "line_comment" | "block_comment" | "attribute_item")
+}
+
+fn is_cs_item_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class_declaration"
+            | "struct_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "namespace_declaration"
+            | "file_scoped_namespace_declaration"
+            | "method_declaration"
+            | "property_declaration"
+            | "field_declaration"
+            | "constructor_declaration"
+            | "destructor_declaration"
+            | "delegate_declaration"
+            | "event_declaration"
+            | "event_field_declaration"
+            | "record_declaration"
+            | "using_directive"
+    )
+}
+
+fn is_cs_leading_trivia(kind: &str) -> bool {
+    matches!(
+        kind,
+        "comment" | "line_comment" | "block_comment" | "attribute_list"
+    )
+}
+
+pub fn chunk_c_sharp(content: &str) -> Option<Vec<CodeChunk>> {
+    let mut parser = Parser::new();
+
+    let language = tree_sitter_c_sharp::language();
+    parser.set_language(&language).ok()?;
+
+    let tree = parser.parse(content, None)?;
+    let root = tree.root_node();
+
+    if root.has_error() {
+        return None;
+    }
+
+    let mut chunks = Vec::new();
+    let mut cursor = root.walk();
+    let children: Vec<Node<'_>> = root.children(&mut cursor).collect();
+
+    let mut i = 0usize;
+    let mut pending_trivia_start: Option<usize> = None;
+
+    while i < children.len() {
+        let node = children[i];
+        let kind = node.kind();
+
+        if is_cs_leading_trivia(kind) {
+            if pending_trivia_start.is_none() {
+                pending_trivia_start = Some(node.start_byte());
+            }
+            i += 1;
+            continue;
+        }
+
+        if is_cs_item_node(kind) {
+            let start_byte = pending_trivia_start
+                .take()
+                .unwrap_or_else(|| node.start_byte());
+            let end_byte = node.end_byte();
+            push_cs_item_chunk(content, node, start_byte, end_byte, &mut chunks);
+        } else {
+            pending_trivia_start = None;
+            let start_byte = node.start_byte();
+            let end_byte = node.end_byte();
+            emit_chunk_from_bytes(content, start_byte, end_byte, &mut chunks);
+        }
+
+        i += 1;
+    }
+
+    if let Some(start_byte) = pending_trivia_start {
+        emit_chunk_from_bytes(content, start_byte, content.len(), &mut chunks);
+    }
+
+    if chunks.is_empty() {
+        None
+    } else {
+        Some(chunks)
+    }
+}
+
+fn push_cs_item_chunk(
+    source: &str,
+    node: Node<'_>,
+    start_byte: usize,
+    end_byte: usize,
+    chunks: &mut Vec<CodeChunk>,
+) {
+    let span_len = end_byte.saturating_sub(start_byte);
+
+    if span_len <= MAX_CHUNK_CHARS {
+        emit_chunk_from_bytes(source, start_byte, end_byte, chunks);
+        return;
+    }
+
+    match node.kind() {
+        "class_declaration"
+        | "struct_declaration"
+        | "interface_declaration"
+        | "namespace_declaration"
+        | "record_declaration" => {
+            split_cs_container_by_inner_items(source, node, chunks);
+        }
+        _ => {
+            let text = &source[start_byte..end_byte];
+            let base_line = byte_to_line(source, start_byte);
+            chunks.extend(soft_split_by_braces(text, base_line));
+        }
+    }
+}
+
+fn split_cs_container_by_inner_items(source: &str, node: Node<'_>, chunks: &mut Vec<CodeChunk>) {
+    let mut cursor = node.walk();
+    let decl_list = node
+        .children(&mut cursor)
+        .find(|c| c.kind() == "declaration_list");
+
+    let header_end = decl_list
+        .map(|b| b.start_byte())
+        .unwrap_or(node.start_byte());
+    let header = source[node.start_byte()..header_end].trim_end();
+
+    let Some(body) = decl_list else {
+        emit_chunk_from_bytes(source, node.start_byte(), node.end_byte(), chunks);
+        return;
+    };
+
+    let mut body_cursor = body.walk();
+    let members: Vec<Node<'_>> = body.children(&mut body_cursor).collect();
+    let mut pending_trivia_start: Option<usize> = None;
+
+    for member in members {
+        let kind = member.kind();
+        if is_cs_leading_trivia(kind) {
+            if pending_trivia_start.is_none() {
+                pending_trivia_start = Some(member.start_byte());
+            }
+            continue;
+        }
+        if kind == "{" || kind == "}" {
+            continue;
+        }
+
+        let start_byte = pending_trivia_start
+            .take()
+            .unwrap_or_else(|| member.start_byte());
+        let end_byte = member.end_byte();
+        let member_text = &source[start_byte..end_byte];
+
+        let combined = format!("{}\n    // ...\n{}", header, member_text);
+        let base_line = byte_to_line(source, start_byte);
+
+        if combined.len() > MAX_CHUNK_CHARS {
+            chunks.extend(soft_split_by_braces(&combined, base_line));
+        } else {
+            chunks.push(CodeChunk {
+                content: combined.to_string(),
+                start_line: base_line,
+                end_line: base_line + member_text.lines().count().saturating_sub(1),
+            });
+        }
+    }
+}
+
+fn is_cpp_item_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_definition"
+            | "class_specifier"
+            | "struct_specifier"
+            | "enum_specifier"
+            | "union_specifier"
+            | "namespace_definition"
+            | "template_declaration"
+            | "declaration"
+            | "type_definition"
+            | "using_declaration"
+            | "alias_declaration"
+            | "linkage_specification"
+            | "concept_definition"
+            | "preproc_include"
+            | "preproc_def"
+            | "preproc_function_def"
+            | "preproc_ifdef"
+            | "preproc_if"
+    )
+}
+
+/// Leading comments and C++ attributes that belong with the following declaration.
+fn is_cpp_leading_trivia(kind: &str) -> bool {
+    matches!(
+        kind,
+        "comment" | "attribute_declaration" | "attribute_specifier"
+    )
+}
+
+pub fn chunk_cpp(content: &str) -> Option<Vec<CodeChunk>> {
+    let mut parser = Parser::new();
+    let language = tree_sitter_cpp::language().into();
+    parser.set_language(&language).ok()?;
+
+    let tree = parser.parse(content, None)?;
+    let root = tree.root_node();
+
+    if root.has_error() {
+        // Fall back to generic chunker on mid-edit parse failure
+        return None;
+    }
+
+    let mut chunks = Vec::new();
+    let mut cursor = root.walk();
+    let children: Vec<Node<'_>> = root.children(&mut cursor).collect();
+
+    let mut i = 0usize;
+    let mut pending_trivia_start: Option<usize> = None;
+
+    while i < children.len() {
+        let node = children[i];
+        let kind = node.kind();
+
+        if is_cpp_leading_trivia(kind) {
+            if pending_trivia_start.is_none() {
+                pending_trivia_start = Some(node.start_byte());
+            }
+            i += 1;
+            continue;
+        }
+
+        if is_cpp_item_node(kind) {
+            let start_byte = pending_trivia_start
+                .take()
+                .unwrap_or_else(|| node.start_byte());
+            let end_byte = node.end_byte();
+            push_cpp_item_chunk(content, node, start_byte, end_byte, &mut chunks);
+        } else {
+            pending_trivia_start = None;
+            let start_byte = node.start_byte();
+            let end_byte = node.end_byte();
+            emit_chunk_from_bytes(content, start_byte, end_byte, &mut chunks);
+        }
+
+        i += 1;
+    }
+
+    if let Some(start_byte) = pending_trivia_start {
+        emit_chunk_from_bytes(content, start_byte, content.len(), &mut chunks);
+    }
+
+    if chunks.is_empty() {
+        None
+    } else {
+        Some(chunks)
+    }
+}
+
+/// Emits small C/C++ items or splits oversized classes, structs, or namespaces.
+fn push_cpp_item_chunk(
+    source: &str,
+    node: Node<'_>,
+    start_byte: usize,
+    end_byte: usize,
+    chunks: &mut Vec<CodeChunk>,
+) {
+    let span_len = end_byte.saturating_sub(start_byte);
+
+    if span_len <= MAX_CHUNK_CHARS {
+        emit_chunk_from_bytes(source, start_byte, end_byte, chunks);
+        return;
+    }
+
+    match node.kind() {
+        "class_specifier"
+        | "struct_specifier"
+        | "namespace_definition"
+        | "linkage_specification"
+        | "template_declaration" => {
+            split_cpp_container_by_inner_items(source, node, chunks);
+        }
+        _ => {
+            let text = &source[start_byte..end_byte];
+            let base_line = byte_to_line(source, start_byte);
+            chunks.extend(soft_split_by_braces(text, base_line));
+        }
+    }
+}
+
+/// Splits oversized C++ classes/namespaces per-method while preserving the class signature.
+fn split_cpp_container_by_inner_items(
+    source: &str,
+    node: Node<'_>,
+    chunks: &mut Vec<CodeChunk>,
+) {
+    let mut cursor = node.walk();
+    let body_node = node.children(&mut cursor).find(|c| {
+        matches!(
+            c.kind(),
+            "field_declaration_list" | "declaration_list" | "compound_statement"
+        )
+    });
+
+    let header_end = body_node.map(|b| b.start_byte()).unwrap_or(node.start_byte());
+    let header = source[node.start_byte()..header_end].trim_end();
+
+    let Some(body) = body_node else {
+        emit_chunk_from_bytes(source, node.start_byte(), node.end_byte(), chunks);
+        return;
+    };
+
+    let mut body_cursor = body.walk();
+    let members: Vec<Node<'_>> = body.children(&mut body_cursor).collect();
+    let mut pending_trivia_start: Option<usize> = None;
+
+    for member in members {
+        let kind = member.kind();
+        if is_cpp_leading_trivia(kind) {
+            if pending_trivia_start.is_none() {
+                pending_trivia_start = Some(member.start_byte());
+            }
+            continue;
+        }
+        if kind == "{" || kind == "}" || kind == ";" || kind == "access_specifier" {
+            continue;
+        }
+
+        let start_byte = pending_trivia_start
+            .take()
+            .unwrap_or_else(|| member.start_byte());
+        let end_byte = member.end_byte();
+        let member_text = &source[start_byte..end_byte];
+
+        let combined = format!("{}\n    // ...\n{}", header, member_text);
+        let base_line = byte_to_line(source, start_byte);
+
+        if combined.len() > MAX_CHUNK_CHARS {
+            chunks.extend(soft_split_by_braces(&combined, base_line));
+        } else {
+            chunks.push(CodeChunk {
+                content: combined.to_string(),
+                start_line: base_line,
+                end_line: base_line + member_text.lines().count().saturating_sub(1),
+            });
+        }
+    }
 }
 
 fn chunk_rust(content: &str) -> Option<Vec<CodeChunk>> {
@@ -99,9 +430,6 @@ fn chunk_rust(content: &str) -> Option<Vec<CodeChunk>> {
     let root = tree.root_node();
 
     if root.has_error() {
-        // Don't silently ship chunks built from a broken parse (e.g. a file
-        // mid-edit with unbalanced braces) — fall back to the safe generic
-        // chunker instead.
         return None;
     }
 
@@ -131,9 +459,6 @@ fn chunk_rust(content: &str) -> Option<Vec<CodeChunk>> {
             let end_byte = node.end_byte();
             push_item_chunk(content, node, start_byte, end_byte, &mut chunks);
         } else {
-            // Non-item top-level node (e.g. `use` statement, top-level
-            // expression in a test file). Emit as its own small chunk rather
-            // than dropping it — still useful for search/context.
             pending_trivia_start = None;
             let start_byte = node.start_byte();
             let end_byte = node.end_byte();
@@ -143,8 +468,6 @@ fn chunk_rust(content: &str) -> Option<Vec<CodeChunk>> {
         i += 1;
     }
 
-    // Trailing trivia with nothing after it (e.g. a final orphaned comment
-    // block) — keep it rather than silently discarding.
     if let Some(start_byte) = pending_trivia_start {
         emit_chunk_from_bytes(content, start_byte, content.len(), &mut chunks);
     }
@@ -156,11 +479,6 @@ fn chunk_rust(content: &str) -> Option<Vec<CodeChunk>> {
     }
 }
 
-/// Handles a single item node: if it's small enough, emit as one chunk. If
-/// it's an oversized `impl`/`trait`/`mod` block, recurse into its inner items
-/// so each method gets its own chunk while still carrying the enclosing
-/// header (e.g. `impl Foo for Bar`) as context. Anything else oversized goes
-/// through the brace-aware soft splitter.
 fn push_item_chunk(
     source: &str,
     node: Node,
@@ -180,10 +498,6 @@ fn push_item_chunk(
             split_container_by_inner_items(source, node, chunks);
         }
         _ => {
-            // Oversized single function/struct/enum/macro — no smaller AST
-            // unit to split into cleanly (splitting mid-signature or
-            // mid-variant list would lose more than it saves), so fall back
-            // to brace-aware soft splitting on the raw byte range.
             let text = &source[start_byte..end_byte];
             let base_line = byte_to_line(source, start_byte);
             chunks.extend(soft_split_by_braces(text, base_line));
@@ -191,10 +505,6 @@ fn push_item_chunk(
     }
 }
 
-/// Splits an oversized `impl`/`trait`/`mod` block into per-member chunks,
-/// each prefixed with the container's own header line(s) up to its opening
-/// `{`, so a method chunk still shows `impl Foo for Bar` / `impl<T> Foo<T>`
-/// without needing the rest of the block for context.
 fn split_container_by_inner_items(source: &str, node: Node, chunks: &mut Vec<CodeChunk>) {
     let header_end = find_body_start(node, source).unwrap_or(node.start_byte());
     let header = source[node.start_byte()..header_end].trim_end();
@@ -242,8 +552,6 @@ fn split_container_by_inner_items(source: &str, node: Node, chunks: &mut Vec<Cod
     }
 }
 
-/// Finds the byte offset just before a node's `{` body, i.e. the end of its
-/// signature/header, by locating the `body` field's start.
 fn find_body_start(node: Node, _source: &str) -> Option<usize> {
     node.child_by_field_name("body").map(|b| b.start_byte())
 }
@@ -277,12 +585,6 @@ fn byte_to_line(source: &str, byte_offset: usize) -> usize {
         + 1
 }
 
-/// Splits an oversized standalone item's text (a single huge function,
-/// struct, etc. with no smaller AST unit to divide into) at brace-depth-aware
-/// boundaries — preferring a blank line or a `}` back at low nesting depth —
-/// rather than cutting on an arbitrary line count. `base_line` is the
-/// 1-indexed line number of `text`'s first line within the original file, so
-/// returned chunks carry correct absolute line numbers.
 fn soft_split_by_braces(text: &str, base_line: usize) -> Vec<CodeChunk> {
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
@@ -339,21 +641,6 @@ fn push_offset_chunk(
     });
 }
 
-// ---------------------------------------------------------------------
-// Generic fallback: brace/indent-aware chunker for non-Rust languages
-// ---------------------------------------------------------------------
-
-/// Improved fallback for languages without a wired-up tree-sitter grammar.
-/// Unlike the old version, this:
-/// - Tracks brace depth so it only treats a keyword line as a boundary when
-///   it's at (or near) the shallowest indentation seen so far, avoiding the
-///   old bug where a nested method looked identical to a top-level function.
-/// - Buffers comment/decorator lines and attaches them to the following
-///   code block instead of letting them independently trigger a split.
-/// - Uses a character budget instead of a flat line count.
-/// - Prefers splitting at a blank line or a low-indentation closing brace
-///   near the budget, rather than cutting on the exact Nth line.
-/// - Applies a small line overlap between consecutive chunks.
 fn chunk_generic_fallback(content: &str) -> Vec<CodeChunk> {
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() {
@@ -396,10 +683,10 @@ fn chunk_generic_fallback(content: &str) -> Vec<CodeChunk> {
     let comment_prefixes = ["//", "#", "/*", "*", "'''", "\"\"\""];
 
     let mut chunks = Vec::new();
-    let mut chunk_start_idx = 0usize; // 0-based line index
+    let mut chunk_start_idx = 0usize;
     let mut pending_trivia_start: Option<usize> = None;
     let mut depth: i64 = 0;
-    let mut chunk_min_depth: i64 = 0; // shallowest depth seen inside current chunk
+    let mut chunk_min_depth: i64 = 0;
 
     let mut i = 0usize;
     while i < lines.len() {
@@ -415,9 +702,6 @@ fn chunk_generic_fallback(content: &str) -> Vec<CodeChunk> {
         }
 
         let is_boundary_candidate = boundary_keywords.iter().any(|kw| trimmed.starts_with(kw))
-            // only treat it as a real top-level boundary if we're back near
-            // the shallowest depth this chunk has seen — this is what stops
-            // a nested method from being mistaken for a new top-level chunk
             && indent_depth <= chunk_min_depth
             && i > chunk_start_idx;
 
@@ -432,9 +716,6 @@ fn chunk_generic_fallback(content: &str) -> Vec<CodeChunk> {
                 pending_trivia_start = None;
             }
         } else if current_len > MAX_CHUNK_CHARS {
-            // Budget exceeded with no clean semantic boundary in sight —
-            // prefer a blank line or a closing brace at low depth near here
-            // rather than cutting on whatever line we happen to be at.
             let split_at = find_soft_break(&lines, chunk_start_idx, i, depth);
             if split_at > chunk_start_idx {
                 push_fallback_chunk(&lines, chunk_start_idx, split_at, &mut chunks);
@@ -466,8 +747,6 @@ fn chunk_generic_fallback(content: &str) -> Vec<CodeChunk> {
     }
 }
 
-/// Looks backward from `hint_idx` for a low-depth closing brace or a blank
-/// line to use as a clean split point, instead of cutting mid-statement.
 fn find_soft_break(
     lines: &[&str],
     chunk_start: usize,
@@ -506,10 +785,6 @@ fn push_fallback_chunk(
         end_line: end_idx + 1,
     });
 }
-
-// ---------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -586,5 +861,54 @@ impl Foo {
             "oversized impl should split into multiple chunks"
         );
         assert!(chunks.iter().all(|c| c.content.contains("impl Widget")));
+    }
+
+    #[cfg(test)]
+    mod cs_tests {
+        use super::*;
+
+        #[test]
+        fn csharp_attributes_and_comments_stay_attached() {
+            let src = r#"
+            using UnityEngine;
+
+            public class Player : MonoBehaviour {
+                [SerializeField]
+                [Header("Movement")]
+                private float speed = 10f;
+
+                /// 
+                /// Unity Start lifecycle method.
+                /// 
+                void Start() {
+                    Debug.Log("Initialized");
+                }
+            }
+            "#;
+            let chunks = chunk_c_sharp(src).expect("should parse");
+            assert_eq!(chunks.len(), 1);
+            assert!(chunks[0].content.contains("[SerializeField]"));
+            assert!(chunks[0].content.contains("void Start()"));
+        }
+
+        #[test]
+        fn oversized_monobehaviour_splits_per_method_with_class_header() {
+            let mut body = String::from("public class EnemyAI : MonoBehaviour {\n");
+            for i in 0..30 {
+                body.push_str(&format!(
+                "    [ClientRpc]\n    void RpcPerformAction_{i}() {{\n        // large padding line to force chunk overflow beyond MAX_CHUNK_CHARS budget\n        Debug.Log(\"Action {i}\");\n    }}\n\n"
+            ));
+            }
+            body.push_str("}\n");
+
+            let chunks = chunk_c_sharp(&body).expect("should parse");
+            assert!(chunks.len() > 1, "oversized class should split");
+            assert!(
+                chunks
+                    .iter()
+                    .all(|c| c.content.contains("public class EnemyAI : MonoBehaviour"))
+            );
+            assert!(chunks[0].content.contains("[ClientRpc]"));
+        }
     }
 }
