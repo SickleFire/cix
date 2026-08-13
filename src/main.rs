@@ -2,10 +2,16 @@
 //!
 //! `cix` is a CLI tool providing fast indexed code search, codebase RAG question-answering (`cix ask`),
 //! and AI-driven automated code modification (`cix edit`).
+//!
+//! `ask` and `edit` are both driven by a small ReAct-style agent loop: the model is given a
+//! fixed set of tools (search_codebase, read_file, list_directory, run_command, and — for
+//! `edit` only — write_file_edits) and repeatedly emits a single JSON "next action" until it
+//! calls `final_answer`. After edits are applied, the agent automatically runs the project's
+//! build/test command (if one can be detected) and feeds any failure back to the model so it
+//! can attempt a fix, up to a small retry budget.
 
 use clap::{Parser, Subcommand};
 use colored::*;
-use futures_util::StreamExt;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -13,11 +19,13 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
 use tantivy::{Index, ReloadPolicy, TantivyDocument, Term, doc};
+use tokio::process::Command as TokioCommand;
+use tokio::time::timeout;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -56,7 +64,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Ask an LLM a question about your codebase using retrieved context
+    /// Ask an LLM a question about your codebase using an agentic retrieval loop
     Ask {
         /// The question to ask about your codebase
         question: String,
@@ -77,9 +85,13 @@ enum Commands {
         /// Target directory
         #[arg(default_value = ".")]
         target_directory: String,
+
+        /// Skip the multi-step agent loop and answer using a single RAG retrieval pass
+        #[arg(long, default_value_t = false)]
+        one_shot: bool,
     },
 
-    /// Request the AI to modify files in your codebase
+    /// Request the AI agent to modify files in your codebase, verifying its own work
     Edit {
         /// Instruction for the code modification
         instruction: String,
@@ -100,6 +112,10 @@ enum Commands {
         /// Target directory
         #[arg(default_value = ".")]
         target_directory: String,
+
+        /// Skip agent loop and apply edits in a single RAG request
+        #[arg(long, default_value_t = false)]
+        one_shot: bool,
     },
 }
 
@@ -108,10 +124,10 @@ struct OllamaRequest {
     model: String,
     prompt: String,
     stream: bool,
-    /// JSON schema for constrained decoding. `None` for free-form answers
-    /// (e.g. `cix ask`), `Some(schema)` when the response must match a
-    /// structural contract (e.g. `cix edit`'s edit-block list). Skipped
-    /// entirely when absent so Ollama sees no `format` field at all.
+    /// JSON schema for constrained decoding. `None` for free-form answers,
+    /// `Some(schema)` when the response must match a structural contract
+    /// (e.g. the agent's next-action shape). Skipped entirely when absent
+    /// so Ollama sees no `format` field at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     format: Option<serde_json::Value>,
 }
@@ -119,7 +135,6 @@ struct OllamaRequest {
 #[derive(Deserialize)]
 struct OllamaResponse {
     response: String,
-    done: bool,
 }
 
 #[derive(Serialize)]
@@ -184,9 +199,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model,
         provider,
         target_directory,
+        one_shot,
     }) = &cli.command
     {
-        run_ask_pipeline(question, model, provider, target_directory, &app_cache_dir).await?;
+        if *one_shot {
+            run_one_shot_ask_pipeline(question, model, provider, target_directory, &app_cache_dir)
+                .await?;
+        } else {
+            run_ask_agent_pipeline(question, model, provider, target_directory, &app_cache_dir)
+                .await?;
+        }
+
         return Ok(());
     }
 
@@ -196,16 +219,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model,
         provider,
         target_directory,
+        one_shot,
     }) = &cli.command
     {
-        run_edit_pipeline(
-            instruction,
-            model,
-            provider,
-            target_directory,
-            &app_cache_dir,
-        )
-        .await?;
+        if *one_shot {
+            run_one_shot_edit_pipeline(
+                instruction,
+                model,
+                provider,
+                target_directory,
+                &app_cache_dir,
+            )
+            .await?;
+        } else {
+            run_edit_agent_pipeline(
+                instruction,
+                model,
+                provider,
+                target_directory,
+                &app_cache_dir,
+            )
+            .await?;
+        }
+
         return Ok(());
     }
 
@@ -263,190 +299,927 @@ fn extract_keywords(question: &str) -> String {
     }
 }
 
-/// Executes the RAG question-answering pipeline: retrieves relevant file contexts
-/// from the index and queries Gemini API (or local Ollama as fallback).
-async fn run_ask_pipeline(
-    question: &str,
+// =====================================================================================
+// Agent loop: shared "next action" contract, tool implementations, and the ReAct driver
+// used by both `cix ask` and `cix edit`.
+// =====================================================================================
+
+/// A single "next step" the agent model proposes. Every model turn must produce exactly
+/// one of these, encoded as a JSON object, with no other surrounding text.
+#[derive(Deserialize, Debug)]
+struct AgentAction {
+    #[serde(default)]
+    thought: Option<String>,
+    action: String,
+    #[serde(default)]
+    action_input: serde_json::Value,
+}
+
+/// JSON schema used to constrain Ollama's decoding for the agent loop so the response can
+/// only ever be `{thought?, action, action_input}` — no prose, no markdown fences, no
+/// half-finished JSON.
+fn agent_action_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "thought": { "type": "string" },
+            "action": { "type": "string" },
+            "action_input": { "type": "object" }
+        },
+        "required": ["action", "action_input"]
+    })
+}
+
+/// Best-effort extraction of a JSON object from a blob of text, for models that ignore the
+/// "respond with ONLY JSON" instruction and wrap it in prose or markdown fences.
+fn extract_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end > start {
+        Some(&text[start..=end])
+    } else {
+        None
+    }
+}
+
+/// Calls the Gemini API once with a fully-formed prompt and returns the raw text response.
+async fn call_gemini_once(
     model: &str,
-    provider: &str,
-    target_dir: &str,
-    app_cache_dir: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", "Retrieving codebase context...".cyan());
+    prompt: String,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let api_key = std::env::var("GEMINI_API_KEY")
+        .map_err(|_| "GEMINI_API_KEY environment variable is missing.")?;
+    let model_name = model.trim_start_matches("models/");
 
-    let (index, file_path_field, content_field) = ensure_index(target_dir, false, app_cache_dir)?;
-    let reader = index
-        .reader_builder()
-        .reload_policy(ReloadPolicy::OnCommitWithDelay)
-        .try_into()?;
-    let searcher = reader.searcher();
-
-    // Search across both file path and content fields
-    let query_parser = QueryParser::for_index(&index, vec![file_path_field, content_field]);
-    let query = parse_query_with_fuzzy(&query_parser, question);
-
-    let mut top_docs = searcher.search(&query, &TopDocs::with_limit(4).and_offset(0))?;
-
-    // Fallback: If generic question returns no hits, pull top indexed files
-    if top_docs.is_empty() {
-        if let Ok(fallback_query) = query_parser.parse_query("*") {
-            top_docs = searcher.search(&fallback_query, &TopDocs::with_limit(4).and_offset(0))?;
-        }
-    }
-
-    if top_docs.is_empty() {
-        println!("{}", "No relevant code files found for context.".yellow());
-        return Ok(());
-    }
-
-    let mut context_payload = String::new();
-    let mut seen_paths = HashSet::new();
-    println!("{}", "Found relevant context in:".dimmed());
-
-    for (_, doc_address) in top_docs {
-        let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
-        let path = retrieved_doc
-            .get_first(file_path_field)
-            .unwrap()
-            .as_str()
-            .unwrap();
-
-        // Skip duplicate hits for the same file so it isn't fed to the model
-        // multiple times (wastes context budget and confuses smaller models).
-        if !seen_paths.insert(path.to_string()) {
-            continue;
-        }
-
-        let content = retrieved_doc
-            .get_first(content_field)
-            .unwrap()
-            .as_str()
-            .unwrap();
-
-        println!("  • {}", path.bold().green());
-        context_payload.push_str(&format!("\n--- FILE: {} ---\n{}\n", path, content));
-    }
-
-    let prompt = format!(
-        "You are an expert software engineer inspecting a codebase.\n\
-        Use the following retrieved code files to answer the user's question accurately.\n\
-        If the answer is not in the code provided, state what is missing.\n\n\
-        CODEBASE CONTEXT:\n{}\n\n\
-        USER QUESTION:\n{}\n\n\
-        ANSWER:",
-        context_payload, question
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        model_name, api_key
     );
 
     let client = reqwest::Client::new();
+    let body = GeminiRequest {
+        contents: vec![GeminiContent {
+            parts: vec![GeminiPart { text: prompt }],
+        }],
+    };
 
-    // Determine provider based on explicit flag or model name substring
+    let res = client.post(&url).json(&body).send().await?;
+
+    if res.status().is_success() {
+        let gemini_res: GeminiResponse = res.json().await?;
+        Ok(gemini_res
+            .candidates
+            .and_then(|c| c.into_iter().next())
+            .and_then(|c| c.content.parts.into_iter().next())
+            .map(|p| p.text)
+            .unwrap_or_default())
+    } else {
+        Err(format!("Gemini API Error: {}", res.text().await?).into())
+    }
+}
+
+/// Calls the local Ollama server once (non-streaming, since the agent loop needs the full
+/// response text to parse a JSON action) and returns the raw text response.
+async fn call_ollama_once(
+    model: &str,
+    prompt: String,
+    format: Option<serde_json::Value>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let res = client
+        .post("http://localhost:11434/api/generate")
+        .json(&OllamaRequest {
+            model: model.to_string(),
+            prompt,
+            stream: false,
+            format,
+        })
+        .send()
+        .await
+        .map_err(|_| "Failed to connect to local Ollama server at http://localhost:11434.")?;
+
+    let ollama_res: OllamaResponse = res.json().await?;
+    Ok(ollama_res.response)
+}
+
+/// Result of running a shell command via the `run_command` tool.
+struct CommandOutput {
+    success: bool,
+    text: String,
+}
+
+/// Tool: `search_codebase(query)`. Runs a fuzzy full-text query against the Tantivy index
+/// and returns a short preview of each matching file.
+fn tool_search_codebase(
+    query: &str,
+    index: &Index,
+    file_path_field: Field,
+    content_field: Field,
+) -> String {
+    let reader = match index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::OnCommitWithDelay)
+        .try_into()
+    {
+        Ok(r) => r,
+        Err(e) => return format!("Error opening index reader: {}", e),
+    };
+    let searcher = reader.searcher();
+    let query_parser = QueryParser::for_index(index, vec![file_path_field, content_field]);
+    let parsed_query = parse_query_with_fuzzy(&query_parser, query);
+
+    let top_docs = match searcher.search(&parsed_query, &TopDocs::with_limit(5)) {
+        Ok(d) => d,
+        Err(e) => return format!("Search error: {}", e),
+    };
+
+    if top_docs.is_empty() {
+        return "No results found for that query.".to_string();
+    }
+
+    let mut out = String::new();
+    let mut seen = HashSet::new();
+    for (score, doc_address) in top_docs {
+        let retrieved_doc: TantivyDocument = match searcher.doc(doc_address) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let path = retrieved_doc
+            .get_first(file_path_field)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !seen.insert(path.to_string()) {
+            continue;
+        }
+        let content = retrieved_doc
+            .get_first(content_field)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let total_lines = content.lines().count();
+        let preview: String = content.lines().take(15).collect::<Vec<_>>().join("\n");
+        out.push_str(&format!(
+            "FILE: {} (score {:.2}, {} lines total)\n{}\n---\n",
+            path, score, total_lines, preview
+        ));
+    }
+    out
+}
+
+/// Tool: `read_file(path, start_line, end_line)`. Reads a specific, bounded line range from
+/// a file so the agent can pull precise context without re-reading whole files.
+fn tool_read_file(target_dir: &str, path: &str, start_line: usize, end_line: usize) -> String {
+    let resolved = match resolve_file_path(path, target_dir) {
+        Some(p) => p,
+        None => return format!("Error: file not found: {}", path),
+    };
+
+    let content = match fs::read_to_string(&resolved) {
+        Ok(c) => c,
+        Err(e) => return format!("Error reading {}: {}", resolved.display(), e),
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    if total == 0 {
+        return "(file is empty)".to_string();
+    }
+
+    let start = start_line.max(1);
+    if start > total {
+        return format!(
+            "Error: start_line {} is beyond file length ({} lines)",
+            start, total
+        );
+    }
+    let requested_end = end_line.max(start).min(total);
+    // Guard against runaway reads eating the whole context budget.
+    let capped_end = requested_end.min(start + 400 - 1).min(total);
+
+    let mut out = String::new();
+    for i in start..=capped_end {
+        out.push_str(&format!("{:>5}: {}\n", i, lines[i - 1]));
+    }
+    if capped_end < requested_end {
+        out.push_str(&format!(
+            "...[truncated at line {}; request a narrower range to see more]\n",
+            capped_end
+        ));
+    }
+    out
+}
+
+/// Tool: `list_directory(path)`. Lists the immediate children of a directory relative to the
+/// target project root, skipping VCS/build/dependency clutter.
+fn tool_list_directory(target_dir: &str, rel_path: &str) -> String {
+    let base = std::path::Path::new(target_dir);
+    let dir = if rel_path.trim().is_empty() || rel_path == "." {
+        base.to_path_buf()
+    } else {
+        base.join(rel_path)
+    };
+
+    if !dir.exists() || !dir.is_dir() {
+        return format!("Error: directory not found: {}", dir.display());
+    }
+
+    let mut entries = Vec::new();
+    match fs::read_dir(&dir) {
+        Ok(rd) => {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') || name == "node_modules" || name == "target" {
+                    continue;
+                }
+                let kind = if entry.path().is_dir() { "dir" } else { "file" };
+                entries.push(format!("[{}] {}", kind, name));
+            }
+        }
+        Err(e) => return format!("Error listing {}: {}", dir.display(), e),
+    }
+
+    entries.sort();
+    if entries.is_empty() {
+        "(empty directory)".to_string()
+    } else {
+        entries.join("\n")
+    }
+}
+
+/// Tool: `run_command(cmd)`. Runs a shell command in the target project root (e.g.
+/// `cargo check`, `cargo test`, `npm test`) with a timeout, and reports whether it succeeded.
+async fn tool_run_command(target_dir: &str, cmd: &str) -> CommandOutput {
+    println!("{}", format!(" Running: {}", cmd).cyan());
+
+    let (shell, flag) = if cfg!(target_os = "windows") {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
+
+    let fut = TokioCommand::new(shell)
+        .arg(flag)
+        .arg(cmd)
+        .current_dir(target_dir)
+        .output();
+
+    match timeout(Duration::from_secs(120), fut).await {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let success = output.status.success();
+            let mut combined = format!(
+                "exit status: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status, stdout, stderr
+            );
+            if combined.len() > 6000 {
+                combined.truncate(6000);
+                combined.push_str("\n...[truncated]");
+            }
+            CommandOutput {
+                success,
+                text: combined,
+            }
+        }
+        Ok(Err(e)) => CommandOutput {
+            success: false,
+            text: format!("Error executing command: {}", e),
+        },
+        Err(_) => CommandOutput {
+            success: false,
+            text: "Error: command timed out after 120 seconds".to_string(),
+        },
+    }
+}
+
+/// Detects a reasonable build/test command for the self-correction loop based on common
+/// project marker files. Returns `None` if nothing recognizable is present, in which case
+/// the agent simply isn't given automatic build feedback.
+fn detect_build_command(target_dir: &str) -> Option<String> {
+    let base = std::path::Path::new(target_dir);
+    if base.join("Cargo.toml").exists() {
+        Some("cargo check --message-format short".to_string())
+    } else if base.join("package.json").exists() {
+        Some("npm test --silent".to_string())
+    } else if base.join("pyproject.toml").exists() || base.join("requirements.txt").exists() {
+        Some("python -m pytest -q".to_string())
+    } else if base.join("go.mod").exists() {
+        Some("go build ./...".to_string())
+    } else {
+        None
+    }
+}
+
+/// Parses the `edits` array from a `write_file_edits` action's `action_input` into
+/// `EditBlock`s, dropping any entries missing required fields.
+fn parse_edit_blocks_from_value(v: &serde_json::Value) -> Vec<EditBlock> {
+    let arr = match v.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+
+    arr.iter()
+        .filter_map(|item| {
+            let file_path = item.get("file_path")?.as_str()?.to_string();
+            let mode_str = item
+                .get("mode")
+                .and_then(|m| m.as_str())
+                .unwrap_or("replace");
+            let mode = if mode_str == "append" {
+                EditMode::Append
+            } else {
+                EditMode::Replace
+            };
+            let search = item
+                .get("search")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            let replace = item
+                .get("replace")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            if replace.is_empty() {
+                return None;
+            }
+            if mode == EditMode::Replace && search.is_empty() {
+                return None;
+            }
+
+            Some(EditBlock {
+                file_path,
+                mode,
+                search,
+                replace,
+            })
+        })
+        .collect()
+}
+
+/// Validates proposed edits against the files on disk, shows the user a diff, asks for
+/// confirmation, and applies them if approved. Returns an observation string for the agent
+/// plus whether anything was actually written to disk.
+fn propose_and_apply_edits(edits: Vec<EditBlock>, target_dir: &str) -> (String, bool) {
+    if edits.is_empty() {
+        return (
+            "No edit blocks were provided (or none had the required fields).".to_string(),
+            false,
+        );
+    }
+
+    let mut valid_blocks: Vec<(EditBlock, std::path::PathBuf)> = Vec::new();
+    let mut skip_notes = Vec::new();
+
+    for block in edits {
+        let resolved = match resolve_file_path(&block.file_path, target_dir) {
+            Some(p) => p,
+            None => {
+                skip_notes.push(format!("file not found: {}", block.file_path));
+                continue;
+            }
+        };
+
+        if block.mode == EditMode::Replace {
+            let content = match fs::read_to_string(&resolved) {
+                Ok(c) => c,
+                Err(_) => {
+                    skip_notes.push(format!("could not read {}", resolved.display()));
+                    continue;
+                }
+            };
+            let normalized_content = content.replace("\r\n", "\n");
+            let normalized_search = block.search.replace("\r\n", "\n");
+            if !normalized_content.contains(&normalized_search) {
+                skip_notes.push(format!("SEARCH text not found in {}", resolved.display()));
+                continue;
+            }
+        }
+
+        valid_blocks.push((block, resolved));
+    }
+
+    if valid_blocks.is_empty() {
+        return (
+            format!(
+                "No valid edit blocks could be applied. Issues: {}",
+                skip_notes.join("; ")
+            ),
+            false,
+        );
+    }
+
+    println!("\n{}", "Proposed Modifications:".bold().magenta());
+    println!(
+        "{}",
+        "==================================================".dimmed()
+    );
+    for (block, resolved) in &valid_blocks {
+        println!("\nFile: {}", resolved.display().to_string().bold().green());
+        match block.mode {
+            EditMode::Replace => {
+                for line in block.search.lines() {
+                    println!("  {}", format!("- {}", line).red());
+                }
+                for line in block.replace.lines() {
+                    println!("  {}", format!("+ {}", line).green());
+                }
+            }
+            EditMode::Append => {
+                println!("  {}", "(appending to end of file)".dimmed());
+                for line in block.replace.lines() {
+                    println!("  {}", format!("+ {}", line).green());
+                }
+            }
+        }
+    }
+    println!(
+        "\n{}",
+        "==================================================".dimmed()
+    );
+    print!("Apply these changes to disk? [y/N]: ");
+    let _ = std::io::stdout().flush();
+
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return (
+            "Error reading user confirmation from stdin; edits were not applied.".to_string(),
+            false,
+        );
+    }
+
+    if input.trim().eq_ignore_ascii_case("y") {
+        let blocks_only: Vec<EditBlock> = valid_blocks.into_iter().map(|(b, _)| b).collect();
+        match apply_edit_blocks(&blocks_only, target_dir) {
+            Ok(n) => (
+                format!(
+                    "Applied {} edit(s) to disk. Skipped: {}",
+                    n,
+                    if skip_notes.is_empty() {
+                        "none".to_string()
+                    } else {
+                        skip_notes.join("; ")
+                    }
+                ),
+                n > 0,
+            ),
+            Err(e) => (format!("Error applying edits: {}", e), false),
+        }
+    } else {
+        ("User declined to apply these edits.".to_string(), false)
+    }
+}
+
+/// Builds the human-readable tool listing injected into the agent's system prompt.
+fn build_tools_description(allow_write: bool) -> String {
+    let mut desc = String::from(
+        "Available actions (the \"action\" field must be exactly one of these names):\n\
+        - search_codebase: action_input {\"query\": \"<search terms>\"} — full-text search the indexed codebase.\n\
+        - read_file: action_input {\"path\": \"<file path>\", \"start_line\": <int>, \"end_line\": <int>} — read a bounded line range from a file.\n\
+        - list_directory: action_input {\"path\": \"<relative dir path, use '.' for root>\"} — list files/subdirectories.\n\
+        - run_command: action_input {\"cmd\": \"<shell command>\"} — run a shell command in the project root (e.g. to inspect the project or run tests).\n",
+    );
+    if allow_write {
+        desc.push_str(
+            "- write_file_edits: action_input {\"edits\": [{\"file_path\": \"...\", \"mode\": \"replace\"|\"append\", \"search\": \"...\", \"replace\": \"...\"}]} — propose edits to apply to disk. \
+            For \"replace\", \"search\" must be copied verbatim from a file you have actually read or retrieved. For \"append\", omit or empty \"search\". The user will be asked to confirm before anything is written.\n",
+        );
+    }
+    desc.push_str(
+        "- final_answer: action_input {\"answer\": \"<your final answer or summary to the user>\"} — call this when you are done and have nothing further to investigate or change.\n",
+    );
+    desc
+}
+
+const MAX_AGENT_STEPS: usize = 12;
+const MAX_EDIT_BUILD_RETRIES: usize = 3;
+
+/// The shared ReAct-style agent loop used by both `cix ask` and `cix edit`. At each step the
+/// model is given the accumulated Thought/Action/Observation transcript and must respond with
+/// exactly one JSON `AgentAction`. The loop executes the requested tool, appends the result as
+/// an Observation, and repeats until the model calls `final_answer` or the step budget runs out.
+///
+/// When `allow_write` is true (the `edit` case), a successful `write_file_edits` call is
+/// automatically followed by the project's detected build/test command; a failure is fed back
+/// to the model as an Observation so it can attempt a fix, up to `MAX_EDIT_BUILD_RETRIES` times.
+async fn run_agent_loop(
+    goal_description: &str,
+    index: &Index,
+    file_path_field: Field,
+    content_field: Field,
+    target_dir: &str,
+    provider: &str,
+    model: &str,
+    allow_write: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let use_gemini = match provider.to_lowercase().as_str() {
         "gemini" => true,
         "ollama" | "local" => false,
         _ => model.to_lowercase().contains("gemini"),
     };
 
-    if use_gemini {
-        let api_key = std::env::var("GEMINI_API_KEY")
-            .map_err(|_| "GEMINI_API_KEY environment variable is missing.")?;
+    let tools_desc = build_tools_description(allow_write);
+    let system_preamble = format!(
+        "You are an autonomous coding agent working inside a codebase.\n\n\
+        GOAL:\n{}\n\n\
+        Proceed step by step. At EVERY step, respond with ONLY a single JSON object of the shape \
+        {{\"thought\": \"<brief reasoning>\", \"action\": \"<action name>\", \"action_input\": {{...}}}}.\n\
+        Do not include any text outside the JSON object, and do not wrap it in markdown fences.\n\n\
+        {}",
+        goal_description, tools_desc
+    );
 
-        let model_name = model.trim_start_matches("models/");
+    let mut scratchpad = String::new();
+    let mut build_retry_count = 0usize;
+    let mut consecutive_parse_failures = 0usize;
 
-        println!(
-            "\n{}",
-            format!(" Asking Gemini API ({}) ...", model_name)
-                .bold()
-                .cyan()
+    for step in 1..=MAX_AGENT_STEPS {
+        let history = if scratchpad.is_empty() {
+            "(nothing yet — this is your first step)"
+        } else {
+            &scratchpad
+        };
+        let prompt = format!(
+            "{}\n\nTranscript so far:\n{}\n\nWhat is your next action? Respond with ONLY the JSON object.",
+            system_preamble, history
         );
+
         println!(
             "{}",
-            "--------------------------------------------------".dimmed()
+            format!(" [step {}/{}] thinking...", step, MAX_AGENT_STEPS).dimmed()
         );
 
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            model_name, api_key
-        );
-
-        let body = GeminiRequest {
-            contents: vec![GeminiContent {
-                parts: vec![GeminiPart { text: prompt }],
-            }],
+        let raw = if use_gemini {
+            call_gemini_once(model, prompt).await?
+        } else {
+            call_ollama_once(model, prompt, Some(agent_action_schema())).await?
         };
 
-        let res = client.post(&url).json(&body).send().await?;
+        let cleaned = raw
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
 
-        if res.status().is_success() {
-            let gemini_res: GeminiResponse = res.json().await?;
-            if let Some(candidates) = gemini_res.candidates {
-                if let Some(first_candidate) = candidates.first() {
-                    for part in &first_candidate.content.parts {
-                        println!("{}", part.text);
-                    }
+        let parsed: Option<AgentAction> = serde_json::from_str(cleaned)
+            .ok()
+            .or_else(|| extract_json_object(&raw).and_then(|s| serde_json::from_str(s).ok()));
+
+        let action = match parsed {
+            Some(a) => {
+                consecutive_parse_failures = 0;
+                a
+            }
+            None => {
+                consecutive_parse_failures += 1;
+                if consecutive_parse_failures >= 3 {
+                    eprintln!(
+                        "{}",
+                        " Agent repeatedly failed to produce valid JSON actions; stopping."
+                            .red()
+                            .bold()
+                    );
+                    return Ok(());
+                }
+                scratchpad.push_str(
+                    "Observation: Your previous response was not valid JSON matching the required shape. \
+                    Respond with ONLY the JSON object, nothing else.\n",
+                );
+                continue;
+            }
+        };
+
+        if let Some(t) = &action.thought {
+            if !t.trim().is_empty() {
+                println!("  {} {}", "Thought:".dimmed(), t.dimmed());
+            }
+        }
+
+        scratchpad.push_str(&format!(
+            "Thought: {}\nAction: {}\nAction Input: {}\n",
+            action.thought.clone().unwrap_or_default(),
+            action.action,
+            action.action_input
+        ));
+
+        match action.action.as_str() {
+            "final_answer" => {
+                let answer = action
+                    .action_input
+                    .get("answer")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(no answer text provided)");
+                println!("\n{}", "Final answer:".bold().green());
+                println!("{}", answer);
+                return Ok(());
+            }
+            "search_codebase" => {
+                let query = action
+                    .action_input
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                println!("  {} search_codebase(\"{}\")", "Action:".cyan(), query);
+                let obs = tool_search_codebase(query, index, file_path_field, content_field);
+                scratchpad.push_str(&format!("Observation:\n{}\n", obs));
+            }
+            "read_file" => {
+                let path = action
+                    .action_input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let start = action
+                    .action_input
+                    .get("start_line")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as usize;
+                let end = action
+                    .action_input
+                    .get("end_line")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or((start + 100) as u64) as usize;
+                println!(
+                    "  {} read_file(\"{}\", {}, {})",
+                    "Action:".cyan(),
+                    path,
+                    start,
+                    end
+                );
+                let obs = tool_read_file(target_dir, path, start, end);
+                scratchpad.push_str(&format!("Observation:\n{}\n", obs));
+            }
+            "list_directory" => {
+                let path = action
+                    .action_input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".");
+                println!("  {} list_directory(\"{}\")", "Action:".cyan(), path);
+                let obs = tool_list_directory(target_dir, path);
+                scratchpad.push_str(&format!("Observation:\n{}\n", obs));
+            }
+            "run_command" => {
+                let cmd = action
+                    .action_input
+                    .get("cmd")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if cmd.trim().is_empty() {
+                    scratchpad.push_str("Observation: Error: no command provided.\n");
+                } else {
+                    let result = tool_run_command(target_dir, cmd).await;
+                    scratchpad.push_str(&format!(
+                        "Observation ({}):\n{}\n",
+                        if result.success { "success" } else { "failed" },
+                        result.text
+                    ));
                 }
             }
-        } else {
-            let err_text = res.text().await?;
-            eprintln!(
-                "{}",
-                format!("\n Gemini API Error: {}", err_text).red().bold()
-            );
-        }
-    } else {
-        // Local streaming Ollama provider
-        println!(
-            "\n{}",
-            format!(" Asking local Ollama ({}) ...", model)
-                .bold()
-                .magenta()
-        );
-        println!(
-            "{}",
-            "--------------------------------------------------".dimmed()
-        );
+            "write_file_edits" if allow_write => {
+                let edits_val = action
+                    .action_input
+                    .get("edits")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Array(vec![]));
+                let edits = parse_edit_blocks_from_value(&edits_val);
+                let (obs, applied) = propose_and_apply_edits(edits, target_dir);
+                println!("  {} {}", "Observation:".dimmed(), obs.dimmed());
+                scratchpad.push_str(&format!("Observation: {}\n", obs));
 
-        let res = client
-            .post("http://localhost:11434/api/generate")
-            .json(&OllamaRequest {
-                model: model.to_string(),
-                prompt,
-                stream: true,
-                // `ask` is free-form Q&A — no schema constraint. Forcing it
-                // into the edit-block JSON shape would make every answer
-                // garbage or empty.
-                format: None,
-            })
-            .send()
-            .await;
+                if applied {
+                    if let Some(build_cmd) = detect_build_command(target_dir) {
+                        if build_retry_count < MAX_EDIT_BUILD_RETRIES {
+                            println!(
+                                "{}",
+                                format!(" Verifying with build/test check: {}", build_cmd).cyan()
+                            );
+                            let result = tool_run_command(target_dir, &build_cmd).await;
+                            build_retry_count += 1;
 
-        match res {
-            Ok(response) => {
-                let mut stream = response.bytes_stream();
-                let mut stdout = std::io::stdout();
-
-                while let Some(chunk) = stream.next().await {
-                    if let Ok(bytes) = chunk {
-                        let line = String::from_utf8_lossy(&bytes);
-                        for sub_line in line.lines() {
-                            if let Ok(parsed) = serde_json::from_str::<OllamaResponse>(sub_line) {
-                                print!("{}", parsed.response);
-                                stdout.flush()?;
-                                if parsed.done {
-                                    println!();
-                                    break;
-                                }
+                            if result.success {
+                                scratchpad.push_str(&format!(
+                                    "Observation (build check '{}', attempt {}/{}): PASSED.\n{}\n",
+                                    build_cmd,
+                                    build_retry_count,
+                                    MAX_EDIT_BUILD_RETRIES,
+                                    result.text
+                                ));
+                                println!("{}", " Build/test check passed.".green());
+                            } else {
+                                scratchpad.push_str(&format!(
+                                    "Observation (build check '{}', attempt {}/{}): FAILED.\n{}\n\
+                                    Please analyze this error and propose a fix using write_file_edits, \
+                                    or call final_answer explaining the issue if you cannot resolve it.\n",
+                                    build_cmd, build_retry_count, MAX_EDIT_BUILD_RETRIES, result.text
+                                ));
+                                println!(
+                                    "{}",
+                                    " Build/test check failed; feeding error back to the agent."
+                                        .yellow()
+                                );
                             }
+                        } else {
+                            scratchpad.push_str(
+                                "Observation: Maximum build/test retry attempts reached; not running the build check again.\n",
+                            );
                         }
                     }
                 }
             }
-            Err(_) => {
-                eprintln!(
+            other => {
+                scratchpad.push_str(&format!(
+                    "Observation: Unknown action '{}'. Choose one of the actions listed in the system prompt.\n",
+                    other
+                ));
+            }
+        }
+    }
+
+    println!(
+        "{}",
+        " Reached the maximum number of agent steps without a final answer.".yellow()
+    );
+    Ok(())
+}
+
+/// Sets up the index and runs the read-only agent loop to answer a question about the codebase.
+async fn run_ask_agent_pipeline(
+    question: &str,
+    model: &str,
+    provider: &str,
+    target_dir: &str,
+    app_cache_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", "Starting agent to answer your question...".cyan());
+    let (index, file_path_field, content_field) = ensure_index(target_dir, false, app_cache_dir)?;
+
+    let goal = format!(
+        "Answer the user's question about this codebase as accurately as possible. \
+        Use search_codebase, read_file, list_directory, and run_command as needed to gather real \
+        evidence before answering — do not guess. If the answer isn't in the codebase, say so.\n\n\
+        USER QUESTION:\n{}",
+        question
+    );
+
+    run_agent_loop(
+        &goal,
+        &index,
+        file_path_field,
+        content_field,
+        target_dir,
+        provider,
+        model,
+        false,
+    )
+    .await
+}
+
+/// Sets up the index and runs the write-enabled agent loop to carry out a code edit,
+/// automatically verifying the result with a build/test check when possible.
+async fn run_edit_agent_pipeline(
+    instruction: &str,
+    model: &str,
+    provider: &str,
+    target_dir: &str,
+    app_cache_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "{}",
+        "Starting agent to perform the requested edit...".cyan()
+    );
+    let (index, file_path_field, content_field) = ensure_index(target_dir, false, app_cache_dir)?;
+
+    let goal = format!(
+        "Modify the codebase to satisfy the following instruction. Investigate with \
+        search_codebase / read_file / list_directory first so your edits are grounded in the \
+        real file contents, then use write_file_edits to apply changes. After edits are applied \
+        you will automatically be shown the result of the project's build/test check — if it \
+        fails, analyze the error and propose a fix. Call final_answer once the change is \
+        complete (or once you've made a best effort and should report status/blockers).\n\n\
+        INSTRUCTION:\n{}",
+        instruction
+    );
+
+    run_agent_loop(
+        &goal,
+        &index,
+        file_path_field,
+        content_field,
+        target_dir,
+        provider,
+        model,
+        true,
+    )
+    .await
+}
+
+async fn run_one_shot_ask_pipeline(
+    question: &str,
+    model: &str,
+    provider: &str,
+    target_dir: &str,
+    app_cache_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (index, file_path_field, content_field) = ensure_index(target_dir, false, app_cache_dir)?;
+
+    // 1. Perform local index search to extract relevant context snippets
+    let keywords = extract_keywords(question);
+    let context_snippets = tool_search_codebase(&keywords, &index, file_path_field, content_field);
+
+    // 2. Build a single, standalone RAG prompt
+    let prompt = format!(
+        "You are a helpful coding assistant. Answer the user's question based on the provided codebase context.\n\n\
+        CODEBASE CONTEXT:\n{}\n\n\
+        USER QUESTION:\n{}\n",
+        context_snippets, question
+    );
+
+    println!("{}", "Sending one-shot query to LLM...".cyan());
+
+    // 3. Single API call (1 request used)
+    let response = call_gemini_once(model, prompt).await?;
+
+    println!("\n{}", "Answer:".bold().green());
+    println!("{}", response);
+
+    Ok(())
+}
+
+async fn run_one_shot_edit_pipeline(
+    instruction: &str,
+    model: &str,
+    provider: &str,
+    target_dir: &str,
+    app_cache_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", "Starting 1-Shot Edit Pipeline...".cyan());
+
+    // 1. Gather relevant local context using Tantivy search
+    let (index, file_path_field, content_field) = ensure_index(target_dir, false, app_cache_dir)?;
+    let search_terms = extract_keywords(instruction);
+    let codebase_context =
+        tool_search_codebase(&search_terms, &index, file_path_field, content_field);
+
+    // 2. Build a single, structured prompt asking for SEARCH/REPLACE blocks
+    let prompt = format!(
+        "You are an automated code editing tool. Your task is to modify the codebase to satisfy the following instruction.\n\n\
+        INSTRUCTION:\n{}\n\n\
+        RELEVANT CODEBASE CONTEXT:\n{}\n\n\
+        OUTPUT FORMAT:\n\
+        Output your edits using EXACT SEARCH/REPLACE blocks formatted like this:\n\
+        FILE: path/to/file.ext\n\
+        <<<<<<< SEARCH\n\
+        verbatim text to replace\n\
+        =======\n\
+        new replacement text\n\
+        >>>>>>> REPLACE\n\n\
+        Important:\n\
+        - The SEARCH block must match existing code EXACTLY line-by-line.\n\
+        - Output ONLY the edit blocks. No conversational text.",
+        instruction, codebase_context
+    );
+
+    // 3. Make a SINGLE API call
+    let use_gemini = provider.to_lowercase() == "gemini" || model.contains("gemini");
+    let response = if use_gemini {
+        call_gemini_once(model, prompt).await?
+    } else {
+        call_ollama_once(model, prompt, None).await?
+    };
+
+    // 4. Parse SEARCH/REPLACE blocks from response
+    let edit_blocks = parse_edit_blocks(&response);
+    if edit_blocks.is_empty() {
+        println!(
+            "{}",
+            "No valid SEARCH/REPLACE blocks were produced by the model.".yellow()
+        );
+        println!("\nRaw response:\n{}", response);
+        return Ok(());
+    }
+
+    // 5. Present diff and ask user confirmation
+    let (obs, applied) = propose_and_apply_edits(edit_blocks, target_dir);
+    println!("\n{}", obs.bold());
+
+    // 6. Run post-edit build/test check if applied
+    if applied {
+        if let Some(build_cmd) = detect_build_command(target_dir) {
+            println!(
+                "{}",
+                format!(" Running verification build: {}", build_cmd).cyan()
+            );
+            let result = tool_run_command(target_dir, &build_cmd).await;
+            if result.success {
+                println!("{}", " Build passed successfully!".green().bold());
+            } else {
+                println!(
                     "{}",
-                    "\n Failed to connect to local Ollama server at http://localhost:11434."
-                        .red()
-                        .bold()
+                    " Build failed after applying 1-shot edits:".red().bold()
                 );
+                println!("{}", result.text);
             }
         }
     }
@@ -580,366 +1353,9 @@ enum EditMode {
     Append,
 }
 
-/// Executes the code editing pipeline: retrieves relevant code context, requests
-/// structured edit blocks from Gemini (marker-format text) or Ollama
-/// (schema-constrained JSON), and applies changes on confirmation.
-async fn run_edit_pipeline(
-    instruction: &str,
-    model: &str,
-    provider: &str,
-    target_dir: &str,
-    app_cache_dir: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", "Retrieving relevant context for edit...".cyan());
-
-    let (index, file_path_field, content_field) = ensure_index(target_dir, false, app_cache_dir)?;
-    let reader = index
-        .reader_builder()
-        .reload_policy(ReloadPolicy::OnCommitWithDelay)
-        .try_into()?;
-    let searcher = reader.searcher();
-
-    let query_parser = QueryParser::for_index(&index, vec![file_path_field, content_field]);
-    let query = parse_query_with_fuzzy(&query_parser, instruction);
-
-    let mut top_docs = searcher.search(&query, &TopDocs::with_limit(3).and_offset(0))?;
-
-    if top_docs.is_empty() {
-        if let Ok(fallback_query) = query_parser.parse_query("*") {
-            top_docs = searcher.search(&fallback_query, &TopDocs::with_limit(3).and_offset(0))?;
-        }
-    }
-
-    if top_docs.is_empty() {
-        println!("{}", "No relevant code files found to modify.".yellow());
-        return Ok(());
-    }
-
-    let mut context_payload = String::new();
-    let mut seen_paths = HashSet::new();
-    let mut example_snippet: Option<(String, String)> = None; // (path, first_line) for the few-shot example
-    println!("{}", "Target files for context:".dimmed());
-
-    for (_, doc_address) in top_docs {
-        let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
-        let path = retrieved_doc
-            .get_first(file_path_field)
-            .unwrap()
-            .as_str()
-            .unwrap();
-
-        // Skip duplicate hits for the same file.
-        if !seen_paths.insert(path.to_string()) {
-            continue;
-        }
-
-        let content = retrieved_doc
-            .get_first(content_field)
-            .unwrap()
-            .as_str()
-            .unwrap();
-
-        if example_snippet.is_none() {
-            if let Some(first_line) = content.lines().find(|l| !l.trim().is_empty()) {
-                example_snippet = Some((path.to_string(), first_line.to_string()));
-            }
-        }
-
-        println!("  • {}", path.bold().green());
-        context_payload.push_str(&format!("\n--- FILE: {} ---\n{}\n", path, content));
-    }
-
-    let client = reqwest::Client::new();
-    let use_gemini = match provider.to_lowercase().as_str() {
-        "gemini" => true,
-        "ollama" | "local" => false,
-        _ => model.to_lowercase().contains("gemini"),
-    };
-
-    // Gemini has no constrained-decoding hookup here, so it still needs the
-    // marker-format prompt (with a grounded few-shot example — small/medium
-    // models imitate an abstract placeholder literally rather than treating
-    // it as a template). Ollama's output shape is guaranteed by the JSON
-    // schema passed via `format`, so its prompt only needs to describe what
-    // goes in each field, not how to format the response.
-    let prompt = if use_gemini {
-        let format_example = match &example_snippet {
-            Some((path, line)) => format!(
-                "Example (format only — base the SEARCH text on lines that actually \
-                appear in the codebase context below, not on this example):\n\
-                FILE: {}\n\
-                <<<<<<< SEARCH\n\
-                {}\n\
-                =======\n\
-                {}\n\
-                >>>>>>> REPLACE\n",
-                path, line, line
-            ),
-            None => String::from(
-                "Example (format only):\n\
-                FILE: path/to/file.ext\n\
-                <<<<<<< SEARCH\n\
-                exact code lines to match and replace\n\
-                =======\n\
-                new code lines to insert\n\
-                >>>>>>> REPLACE\n",
-            ),
-        };
-
-        format!(
-            "You are an AI coding agent modifying source code.\n\
-            Perform the requested edit strictly using SEARCH/REPLACE blocks formatted exactly as follows:\n\n\
-            {}\n\
-            Rules:\n\
-            1. Keep SEARCH blocks small and unique so they match accurately.\n\
-            2. Preserve exact indentation.\n\
-            3. The SEARCH text must be copied verbatim from the CODEBASE CONTEXT below — never invent or paraphrase it.\n\
-            4. Do not output conversational text or markdown code fences outside of the block structure.\n\n\
-            CODEBASE CONTEXT:\n{}\n\n\
-            INSTRUCTION:\n{}\n",
-            format_example, context_payload, instruction
-        )
-    } else {
-        let anchor_example = match &example_snippet {
-            Some((path, line)) => format!(
-                "\nExample of adding NEW content at the end of a file:\n\
-                {{\"file_path\": \"{}\", \"mode\": \"append\", \"search\": \"\", \"replace\": \"<new content goes here>\"}}\n\
-                (append mode adds `replace` to the end of the file — no anchor needed)\n\n\
-                Example of changing EXISTING content (format only — base the real search on a line \
-                that actually appears in the codebase context below, not on this example):\n\
-                {{\"file_path\": \"{}\", \"mode\": \"replace\", \"search\": \"{}\", \"replace\": \"<updated line>\"}}\n",
-                path, path, line
-            ),
-            None => String::new(),
-        };
-
-        format!(
-            "You are an AI coding agent modifying source code.\n\
-            For each change needed, provide:\n\
-            - file_path: the exact path as it appears in CODEBASE CONTEXT below\n\
-            - mode: either \"replace\" (change existing text) or \"append\" (add new text to the end of the file)\n\
-            - search: for mode \"replace\", text copied verbatim from that file's content — never invent, \
-              paraphrase, or reformat it. It must match the file exactly so it can be located and replaced. \
-              For mode \"append\", leave this as an empty string.\n\
-            - replace: for mode \"replace\", the new text that should take the place of search. \
-              For mode \"append\", the new content to add at the end of the file.\n\n\
-            Keep each search value small and unique enough to match exactly once. Preserve exact indentation.\n\n\
-            IMPORTANT: If the instruction asks to ADD new content (e.g. a new section, a new line, \
-            \"at the bottom\", \"at the end\"), use mode \"append\" rather than trying to force it \
-            through a replace block.\n{}\n\
-            CODEBASE CONTEXT:\n{}\n\n\
-            INSTRUCTION:\n{}\n",
-            anchor_example, context_payload, instruction
-        )
-    };
-
-    let response_text = if use_gemini {
-        let api_key = std::env::var("GEMINI_API_KEY")
-            .map_err(|_| "GEMINI_API_KEY environment variable not set.")?;
-        let model_name = model.trim_start_matches("models/");
-
-        println!(
-            "\n{}",
-            format!(" Generating diffs using Gemini ({}) ...", model_name)
-                .bold()
-                .cyan()
-        );
-
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            model_name, api_key
-        );
-
-        let body = GeminiRequest {
-            contents: vec![GeminiContent {
-                parts: vec![GeminiPart { text: prompt }],
-            }],
-        };
-
-        let res = client.post(&url).json(&body).send().await?;
-        if res.status().is_success() {
-            let gemini_res: GeminiResponse = res.json().await?;
-            gemini_res
-                .candidates
-                .and_then(|c| c.first().cloned())
-                .and_then(|c| c.content.parts.first().cloned())
-                .map(|p| p.text)
-                .unwrap_or_default()
-        } else {
-            return Err(format!("Gemini API Error: {}", res.text().await?).into());
-        }
-    } else {
-        println!(
-            "\n{}",
-            format!(" Generating diffs using local Ollama ({}) ...", model)
-                .bold()
-                .magenta()
-        );
-
-        let res = client
-            .post("http://localhost:11434/api/generate")
-            .json(&OllamaRequest {
-                model: model.to_string(),
-                prompt,
-                stream: false,
-                // Constrain decoding to the edit-block schema so the model
-                // physically cannot emit prose, markdown fences, or a
-                // half-finished block — only valid JSON matching the shape.
-                format: Some(edit_blocks_schema()),
-            })
-            .send()
-            .await?;
-
-        let ollama_res: OllamaResponse = res.json().await?;
-        ollama_res.response
-    };
-
-    // Gemini's response is still marker-format text (replace-only); Ollama's
-    // is schema-constrained JSON (replace + append). Parse each with the
-    // matching parser.
-    let edit_blocks = if use_gemini {
-        parse_edit_blocks(&response_text)
-    } else {
-        parse_edit_blocks_json(&response_text)
-    };
-
-    if edit_blocks.is_empty() {
-        println!(
-            "{}",
-            "No valid edit blocks were generated by the AI.".yellow()
-        );
-        println!("\n{}", "--- Raw model output (for debugging) ---".dimmed());
-        println!("{}", response_text);
-        return Ok(());
-    }
-
-    // Pre-validate every block against the actual file on disk *before*
-    // showing anything to the user, so we never present a diff that can't
-    // possibly be applied (missing file, or SEARCH text that doesn't match).
-    let mut valid_blocks: Vec<(EditBlock, std::path::PathBuf)> = Vec::new();
-
-    for block in edit_blocks {
-        let resolved = match resolve_file_path(&block.file_path, target_dir) {
-            Some(p) => p,
-            None => {
-                eprintln!(
-                    "{}",
-                    format!(" Skipping block: file not found: {}", block.file_path).yellow()
-                );
-                continue;
-            }
-        };
-
-        let content = match fs::read_to_string(&resolved) {
-            Ok(c) => c,
-            Err(_) => {
-                eprintln!(
-                    "{}",
-                    format!(" Skipping block: could not read {}", resolved.display()).yellow()
-                );
-                continue;
-            }
-        };
-
-        // Append blocks don't need SEARCH text to exist anywhere — they just
-        // need a readable target file, which we already confirmed above.
-        if block.mode == EditMode::Replace {
-            let normalized_content = content.replace("\r\n", "\n");
-            let normalized_search = block.search.replace("\r\n", "\n");
-
-            if !normalized_content.contains(&normalized_search) {
-                eprintln!(
-                    "{}",
-                    format!(
-                        " Skipping block: SEARCH text not found in {}",
-                        resolved.display()
-                    )
-                    .yellow()
-                );
-                continue;
-            }
-        }
-
-        valid_blocks.push((block, resolved));
-    }
-
-    if valid_blocks.is_empty() {
-        println!(
-            "{}",
-            "No valid, applicable edit blocks were generated by the AI.".yellow()
-        );
-        println!("\n{}", "--- Raw model output (for debugging) ---".dimmed());
-        println!("{}", response_text);
-        return Ok(());
-    }
-
-    println!("\n{}", "Proposed Modifications:".bold().magenta());
-    println!(
-        "{}",
-        "==================================================".dimmed()
-    );
-
-    for (block, resolved) in &valid_blocks {
-        println!("\nFile: {}", resolved.display().to_string().bold().green());
-        match block.mode {
-            EditMode::Replace => {
-                for line in block.search.lines() {
-                    println!("  {}", format!("- {}", line).red());
-                }
-                for line in block.replace.lines() {
-                    println!("  {}", format!("+ {}", line).green());
-                }
-            }
-            EditMode::Append => {
-                println!("  {}", "(appending to end of file)".dimmed());
-                for line in block.replace.lines() {
-                    println!("  {}", format!("+ {}", line).green());
-                }
-            }
-        }
-    }
-
-    println!(
-        "\n{}",
-        "==================================================".dimmed()
-    );
-    print!("Apply these changes to disk? [y/N]: ");
-    std::io::stdout().flush()?;
-
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-
-    if input.trim().eq_ignore_ascii_case("y") {
-        let blocks_only: Vec<EditBlock> = valid_blocks.into_iter().map(|(b, _)| b).collect();
-        let applied_count = apply_edit_blocks(&blocks_only, target_dir)?;
-        if applied_count > 0 {
-            println!(
-                "{}",
-                format!(
-                    " Successfully applied {} file modification(s)!",
-                    applied_count
-                )
-                .green()
-                .bold()
-            );
-        } else {
-            println!(
-                "{}",
-                " No modifications were applied due to missing files or search mismatches."
-                    .red()
-                    .bold()
-            );
-        }
-    } else {
-        println!("{}", "Operation canceled. No files were modified.".yellow());
-    }
-
-    Ok(())
-}
-
-/// Parses marker-format SEARCH/REPLACE blocks from a text response (Gemini path).
-/// Gemini's prompt only teaches the replace format, so every parsed block is
-/// tagged `EditMode::Replace`.
+/// Parses marker-format SEARCH/REPLACE blocks from a text response. Kept for callers (and
+/// tests) that still want to parse the plain marker format directly; the live agent loop uses
+/// `parse_edit_blocks_from_value` on structured JSON instead.
 fn parse_edit_blocks(raw_text: &str) -> Vec<EditBlock> {
     let mut blocks = Vec::new();
     let mut current_file = String::new();
@@ -960,9 +1376,6 @@ fn parse_edit_blocks(raw_text: &str) -> Vec<EditBlock> {
             replace_lines.clear();
         } else if line.starts_with(">>>>>>> REPLACE") {
             in_replace = false;
-            // Guard against emitting garbage blocks: skip anything without a
-            // real target file or an empty SEARCH section (both indicate the
-            // model didn't ground its output in the actual context).
             if !current_file.is_empty() && !search_lines.is_empty() {
                 blocks.push(EditBlock {
                     file_path: current_file.clone(),
@@ -979,104 +1392,6 @@ fn parse_edit_blocks(raw_text: &str) -> Vec<EditBlock> {
     }
 
     blocks
-}
-
-/// JSON schema used to constrain Ollama's decoding for `cix edit` so the
-/// response can only ever be a list of `{file_path, mode, search, replace}`
-/// objects — no prose, no markdown fences, no half-finished blocks.
-fn edit_blocks_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "edits": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "file_path": { "type": "string", "minLength": 1 },
-                        "mode": { "type": "string", "enum": ["replace", "append"] },
-                        "search": { "type": "string" },
-                        "replace": { "type": "string", "minLength": 1 }
-                    },
-                    "required": ["file_path", "mode", "replace"]
-                }
-            }
-        },
-        "required": ["edits"]
-    })
-}
-
-#[derive(Deserialize)]
-struct EditBlocksResponse {
-    edits: Vec<EditBlockJson>,
-}
-
-#[derive(Deserialize)]
-struct EditBlockJson {
-    file_path: String,
-    mode: String,
-    #[serde(default)]
-    search: String,
-    replace: String,
-}
-
-/// Parses schema-constrained JSON edit blocks from an Ollama response.
-fn parse_edit_blocks_json(raw_text: &str) -> Vec<EditBlock> {
-    match serde_json::from_str::<EditBlocksResponse>(raw_text) {
-        Ok(resp) => resp
-            .edits
-            .into_iter()
-            .filter_map(|e| {
-                if e.file_path.is_empty() {
-                    eprintln!("{}", " Dropping block with empty file_path".yellow());
-                    return None;
-                }
-                if e.replace.is_empty() {
-                    eprintln!(
-                        "{}",
-                        format!(" Dropping block with empty replace for {}", e.file_path).yellow()
-                    );
-                    return None;
-                }
-
-                let mode = match e.mode.as_str() {
-                    "append" => EditMode::Append,
-                    "replace" => EditMode::Replace,
-                    other => {
-                        eprintln!(
-                            "{}",
-                            format!(
-                                " Unrecognized mode '{}' for {}, treating as replace",
-                                other, e.file_path
-                            )
-                            .yellow()
-                        );
-                        EditMode::Replace
-                    }
-                };
-
-                if mode == EditMode::Replace && e.search.is_empty() {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            " Dropping replace block with empty search for {}",
-                            e.file_path
-                        )
-                        .yellow()
-                    );
-                    return None;
-                }
-
-                Some(EditBlock {
-                    file_path: e.file_path,
-                    mode,
-                    search: e.search,
-                    replace: e.replace,
-                })
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    }
 }
 
 /// Resolves candidate file paths proposed by the AI to actual paths on disk.
@@ -1490,6 +1805,74 @@ mod tests {
         assert_eq!(blocks[0].search, "old line");
         assert_eq!(blocks[0].replace, "new line");
         assert_eq!(blocks[0].mode, EditMode::Replace);
+    }
+
+    #[test]
+    fn test_parse_edit_blocks_from_value() {
+        let v = serde_json::json!({
+            "edits": [
+                {"file_path": "src/a.rs", "mode": "replace", "search": "foo", "replace": "bar"},
+                {"file_path": "src/b.rs", "mode": "append", "replace": "// new line"},
+                {"file_path": "src/c.rs", "mode": "replace", "replace": "no search, dropped"}
+            ]
+        });
+        let blocks = parse_edit_blocks_from_value(&v["edits"]);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].mode, EditMode::Replace);
+        assert_eq!(blocks[1].mode, EditMode::Append);
+    }
+
+    #[test]
+    fn test_extract_json_object() {
+        let text = "Sure, here you go:\n```json\n{\"action\": \"final_answer\", \"action_input\": {}}\n```\nlet me know if that helps";
+        let extracted = extract_json_object(text).unwrap();
+        let parsed: AgentAction = serde_json::from_str(extracted).unwrap();
+        assert_eq!(parsed.action, "final_answer");
+    }
+
+    #[test]
+    fn test_agent_action_schema() {
+        let schema = agent_action_schema();
+        assert!(schema.is_object());
+        let obj = schema.as_object().unwrap();
+        assert!(obj.contains_key("properties"));
+    }
+
+    #[test]
+    fn test_detect_build_command() {
+        // In the root directory, Cargo.toml exists, so it should detect cargo check
+        let cmd = detect_build_command(".");
+        assert_eq!(cmd, Some("cargo check --message-format short".to_string()));
+
+        // Nonexistent directory should return None
+        let none_cmd = detect_build_command("nonexistent_dir_abc_123");
+        assert_eq!(none_cmd, None);
+    }
+
+    #[test]
+    fn test_line_matches_keyword() {
+        assert!(line_matches_keyword("fn process_items()", "process"));
+        assert!(line_matches_keyword("fn process_items()", "proces")); // fuzzy match
+        assert!(!line_matches_keyword(
+            "fn process_items()",
+            "completelyunrelated"
+        ));
+    }
+
+    #[test]
+    fn test_tool_list_directory_and_read_file() {
+        // Test listing root directory (should contain Cargo.toml)
+        let listing = tool_list_directory(".", ".");
+        assert!(listing.contains("Cargo.toml"));
+        assert!(listing.contains("src"));
+
+        // Test reading Cargo.toml or src/main.rs
+        let read_res = tool_read_file(".", "Cargo.toml", 1, 5);
+        assert!(read_res.contains("[package]") || read_res.contains("name"));
+
+        // Test error on non-existent file
+        let err_read = tool_read_file(".", "nonexistent_file_xyz.rs", 1, 10);
+        assert!(err_read.contains("Error"));
     }
 }
 
