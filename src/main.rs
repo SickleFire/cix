@@ -176,7 +176,6 @@ struct GeminiResponsePart {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // 1. Handle --clean flag
     let cache_dir = dirs::cache_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     let app_cache_dir = cache_dir.join("cix_indexes");
 
@@ -193,7 +192,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // 2. Handle 'cix ask' Subcommand
     if let Some(Commands::Ask {
         question,
         model,
@@ -213,7 +211,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // 3. Handle 'cix edit' Subcommand
     if let Some(Commands::Edit {
         instruction,
         model,
@@ -245,7 +242,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // 4. Fallback to standard search if no subcommand
     if let Some(query_str) = &cli.query {
         run_search_pipeline(
             query_str,
@@ -1118,17 +1114,15 @@ async fn run_edit_agent_pipeline(
 async fn run_one_shot_ask_pipeline(
     question: &str,
     model: &str,
-    provider: &str,
+    _provider: &str,
     target_dir: &str,
     app_cache_dir: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (index, file_path_field, content_field) = ensure_index(target_dir, false, app_cache_dir)?;
 
-    // 1. Perform local index search to extract relevant context snippets
     let keywords = extract_keywords(question);
     let context_snippets = tool_search_codebase(&keywords, &index, file_path_field, content_field);
 
-    // 2. Build a single, standalone RAG prompt
     let prompt = format!(
         "You are a helpful coding assistant. Answer the user's question based on the provided codebase context.\n\n\
         CODEBASE CONTEXT:\n{}\n\n\
@@ -1138,7 +1132,6 @@ async fn run_one_shot_ask_pipeline(
 
     println!("{}", "Sending one-shot query to LLM...".cyan());
 
-    // 3. Single API call (1 request used)
     let response = call_gemini_once(model, prompt).await?;
 
     println!("\n{}", "Answer:".bold().green());
@@ -1156,13 +1149,11 @@ async fn run_one_shot_edit_pipeline(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "Starting 1-Shot Edit Pipeline...".cyan());
 
-    // 1. Gather relevant local context using Tantivy search
     let (index, file_path_field, content_field) = ensure_index(target_dir, false, app_cache_dir)?;
     let search_terms = extract_keywords(instruction);
     let codebase_context =
         tool_search_codebase(&search_terms, &index, file_path_field, content_field);
 
-    // 2. Build a single, structured prompt asking for SEARCH/REPLACE blocks
     let prompt = format!(
         "You are an automated code editing tool. Your task is to modify the codebase to satisfy the following instruction.\n\n\
         INSTRUCTION:\n{}\n\n\
@@ -1181,7 +1172,6 @@ async fn run_one_shot_edit_pipeline(
         instruction, codebase_context
     );
 
-    // 3. Make a SINGLE API call
     let use_gemini = provider.to_lowercase() == "gemini" || model.contains("gemini");
     let response = if use_gemini {
         call_gemini_once(model, prompt).await?
@@ -1189,7 +1179,6 @@ async fn run_one_shot_edit_pipeline(
         call_ollama_once(model, prompt, None).await?
     };
 
-    // 4. Parse SEARCH/REPLACE blocks from response
     let edit_blocks = parse_edit_blocks(&response);
     if edit_blocks.is_empty() {
         println!(
@@ -1200,11 +1189,9 @@ async fn run_one_shot_edit_pipeline(
         return Ok(());
     }
 
-    // 5. Present diff and ask user confirmation
     let (obs, applied) = propose_and_apply_edits(edit_blocks, target_dir);
     println!("\n{}", obs.bold());
 
-    // 6. Run post-edit build/test check if applied
     if applied {
         if let Some(build_cmd) = detect_build_command(target_dir) {
             println!(
@@ -1782,7 +1769,7 @@ mod tests {
     #[test]
     fn test_is_fuzzy_match() {
         assert!(is_fuzzy_match("search", "search"));
-        assert!(is_fuzzy_match("search", "seach")); // 1 typo
+        assert!(is_fuzzy_match("search", "seach"));
         assert!(!is_fuzzy_match("search", "completelydifferent"));
     }
 
@@ -1840,11 +1827,9 @@ mod tests {
 
     #[test]
     fn test_detect_build_command() {
-        // In the root directory, Cargo.toml exists, so it should detect cargo check
         let cmd = detect_build_command(".");
         assert_eq!(cmd, Some("cargo check --message-format short".to_string()));
 
-        // Nonexistent directory should return None
         let none_cmd = detect_build_command("nonexistent_dir_abc_123");
         assert_eq!(none_cmd, None);
     }
@@ -1852,7 +1837,7 @@ mod tests {
     #[test]
     fn test_line_matches_keyword() {
         assert!(line_matches_keyword("fn process_items()", "process"));
-        assert!(line_matches_keyword("fn process_items()", "proces")); // fuzzy match
+        assert!(line_matches_keyword("fn process_items()", "proces"));
         assert!(!line_matches_keyword(
             "fn process_items()",
             "completelyunrelated"
@@ -1861,22 +1846,18 @@ mod tests {
 
     #[test]
     fn test_tool_list_directory_and_read_file() {
-        // Test listing root directory (should contain Cargo.toml)
         let listing = tool_list_directory(".", ".");
         assert!(listing.contains("Cargo.toml"));
         assert!(listing.contains("src"));
 
-        // Test reading Cargo.toml or src/main.rs
         let read_res = tool_read_file(".", "Cargo.toml", 1, 5);
         assert!(read_res.contains("[package]") || read_res.contains("name"));
 
-        // Test error on non-existent file
         let err_read = tool_read_file(".", "nonexistent_file_xyz.rs", 1, 10);
         assert!(err_read.contains("Error"));
     }
 }
 
-/// Highlights search query keyword matches (including fuzzy matches) in a code line using ANSI color formatting.
 fn highlight_match(line: &str, query: &str) -> String {
     let keywords: Vec<String> = extract_keywords(query)
         .split_whitespace()
