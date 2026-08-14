@@ -140,6 +140,20 @@ struct OllamaResponse {
 #[derive(Serialize)]
 struct GeminiRequest {
     contents: Vec<GeminiContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "generationConfig")]
+    generation_config: Option<GeminiGenerationConfig>,
+}
+
+#[derive(Serialize)]
+struct GeminiGenerationConfig {
+    #[serde(rename = "responseMimeType")]
+    response_mime_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "responseSchema")]
+    response_schema: Option<serde_json::Value>,
+    #[serde(rename = "maxOutputTokens")]
+    max_output_tokens: u32,
 }
 
 #[derive(Serialize)]
@@ -302,13 +316,18 @@ fn extract_keywords(question: &str) -> String {
 
 /// A single "next step" the agent model proposes. Every model turn must produce exactly
 /// one of these, encoded as a JSON object, with no other surrounding text.
-#[derive(Deserialize, Debug)]
-struct AgentAction {
-    #[serde(default)]
-    thought: Option<String>,
+#[derive(Deserialize, Debug, Clone)]
+struct ProposedAction {
     action: String,
     #[serde(default)]
     action_input: serde_json::Value,
+}
+
+#[derive(Deserialize, Debug)]
+struct AgentTurn {
+    #[serde(default)]
+    thought: Option<String>,
+    actions: Vec<ProposedAction>,
 }
 
 /// JSON schema used to constrain Ollama's decoding for the agent loop so the response can
@@ -319,10 +338,21 @@ fn agent_action_schema() -> serde_json::Value {
         "type": "object",
         "properties": {
             "thought": { "type": "string" },
-            "action": { "type": "string" },
-            "action_input": { "type": "object" }
+            "actions": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_ACTIONS_PER_TURN,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string" },
+                        "action_input": { "type": "object" }
+                    },
+                    "required": ["action", "action_input"]
+                }
+            }
         },
-        "required": ["action", "action_input"]
+        "required": ["actions"]
     })
 }
 
@@ -342,6 +372,7 @@ fn extract_json_object(text: &str) -> Option<&str> {
 async fn call_gemini_once(
     model: &str,
     prompt: String,
+    schema: Option<serde_json::Value>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let api_key = std::env::var("GEMINI_API_KEY")
         .map_err(|_| "GEMINI_API_KEY environment variable is missing.")?;
@@ -353,10 +384,19 @@ async fn call_gemini_once(
     );
 
     let client = reqwest::Client::new();
+    let generation_config = schema.map(|s| GeminiGenerationConfig {
+        response_mime_type: "application/json".to_string(),
+        response_schema: Some(s),
+        // Raised from Gemini's default so a full-file generation turn (e.g. an
+        // entire HTML/CSS/JS portfolio page) doesn't get cut off mid-JSON, which
+        // would produce truncated/invalid output regardless of JSON mode.
+        max_output_tokens: 8192,
+    });
     let body = GeminiRequest {
         contents: vec![GeminiContent {
             parts: vec![GeminiPart { text: prompt }],
         }],
+        generation_config,
     };
 
     let res = client.post(&url).json(&body).send().await?;
@@ -464,9 +504,17 @@ fn tool_search_codebase(
 /// Tool: `read_file(path, start_line, end_line)`. Reads a specific, bounded line range from
 /// a file so the agent can pull precise context without re-reading whole files.
 fn tool_read_file(target_dir: &str, path: &str, start_line: usize, end_line: usize) -> String {
+    if path.trim().is_empty() {
+        return "Error: read_file requires a non-empty \"path\" (e.g. the exact path shown by \
+                list_directory, such as \"index.html\"). No path was provided in action_input."
+            .to_string();
+    }
     let resolved = match resolve_file_path(path, target_dir) {
         Some(p) => p,
-        None => return format!("Error: file not found: {}", path),
+        None => return format!(
+            "Error: file not found: '{}'. Call list_directory first and copy an exact path from its output.",
+            path
+        ),
     };
 
     let content = match fs::read_to_string(&resolved) {
@@ -789,7 +837,13 @@ fn propose_and_apply_edits(edits: Vec<EditBlock>, target_dir: &str) -> (String, 
 /// Builds the human-readable tool listing injected into the agent's system prompt.
 fn build_tools_description(allow_write: bool) -> String {
     let mut desc = String::from(
-        "Available actions (the \"action\" field must be exactly one of these names):\n\
+        "Available actions (each \"action\" field must be exactly one of these names). \
+        You may propose MULTIPLE actions in a single turn by listing them all in the \
+        \"actions\" array — e.g. read three files at once, or run several searches — \
+        instead of waiting a full turn per call. Rules: search_codebase, read_file, and \
+        list_directory may appear more than once per turn. run_command and \
+        write_file_edits may each appear AT MOST ONCE per turn. final_answer, if used, \
+        must be the ONLY action in its turn.\n\n\
         - search_codebase: action_input {\"query\": \"<search terms>\"} — full-text search the indexed codebase.\n\
         - read_file: action_input {\"path\": \"<file path>\", \"start_line\": <int>, \"end_line\": <int>} — read a bounded line range from a file.\n\
         - list_directory: action_input {\"path\": \"<relative dir path, use '.' for root>\"} — list files/subdirectories.\n\
@@ -802,11 +856,12 @@ For \"replace\", \"search\" must be copied verbatim from a file you have actuall
         );
     }
     desc.push_str(
-        "- final_answer: action_input {\"answer\": \"<your final answer or summary to the user>\"} — call this when you are done and have nothing further to investigate or change.\n",
+        "- final_answer: action_input {\"answer\": \"<your final answer or summary to the user>\"} — call this ALONE, with nothing else in \"actions\", once you have nothing further to investigate or change.\n",
     );
     desc
 }
 
+const MAX_ACTIONS_PER_TURN: usize = 5;
 const MAX_AGENT_STEPS: usize = 12;
 const MAX_EDIT_BUILD_RETRIES: usize = 3;
 
@@ -1012,7 +1067,7 @@ impl AgentHistory {
         );
 
         let result = if use_gemini {
-            call_gemini_once(model, prompt).await
+            call_gemini_once(model, prompt, Some(agent_action_schema())).await
         } else {
             call_ollama_once(model, prompt, None).await
         };
@@ -1071,8 +1126,8 @@ async fn run_agent_loop(
     let system_preamble = format!(
         "You are an autonomous coding agent working inside a codebase.\n\n\
         GOAL:\n{}\n\n\
-        Proceed step by step. At EVERY step, respond with ONLY a single JSON object of the shape \
-        {{\"thought\": \"<brief reasoning>\", \"action\": \"<action name>\", \"action_input\": {{...}}}}.\n\
+        Proceed step by step. At EVERY turn, respond with ONLY a single JSON object of the shape \
+        {{\"thought\": \"<brief reasoning>\", \"actions\": [{{\"action\": \"<name>\", \"action_input\": {{...}}}}, ...]}}.\n\
         Do not include any text outside the JSON object, and do not wrap it in markdown fences.\n\n\
         {}",
         goal_description, tools_desc
@@ -1081,25 +1136,24 @@ async fn run_agent_loop(
     let mut history = AgentHistory::new();
     let mut build_retry_count = 0usize;
     let mut consecutive_parse_failures = 0usize;
-    // Stall guard: counts consecutive search_codebase calls with nothing else in between.
     let mut consecutive_search_count = 0usize;
 
-    for step in 1..=MAX_AGENT_STEPS {
+    'turns: for step in 1..=MAX_AGENT_STEPS {
         history.maybe_summarize(use_gemini, model).await;
         let transcript = history.render();
 
         let prompt = format!(
-            "{}\n\nTranscript so far:\n{}\n\nWhat is your next action? Respond with ONLY the JSON object.",
+            "{}\n\nTranscript so far:\n{}\n\nWhat are your next action(s)? Respond with ONLY the JSON object.",
             system_preamble, transcript
         );
 
         println!(
             "{}",
-            format!(" [step {}/{}] thinking...", step, MAX_AGENT_STEPS).dimmed()
+            format!(" [turn {}/{}] thinking...", step, MAX_AGENT_STEPS).dimmed()
         );
 
         let raw = if use_gemini {
-            call_gemini_once(model, prompt).await?
+            call_gemini_once(model, prompt, Some(agent_action_schema())).await?
         } else {
             call_ollama_once(model, prompt, Some(agent_action_schema())).await?
         };
@@ -1111,213 +1165,267 @@ async fn run_agent_loop(
             .trim_end_matches("```")
             .trim();
 
-        let parsed: Option<AgentAction> = serde_json::from_str(cleaned)
+        let parsed: Option<AgentTurn> = serde_json::from_str(cleaned)
             .ok()
             .or_else(|| extract_json_object(&raw).and_then(|s| serde_json::from_str(s).ok()));
 
-        let action = match parsed {
-            Some(a) => {
+        let turn = match parsed {
+            Some(t) if !t.actions.is_empty() => {
                 consecutive_parse_failures = 0;
-                a
+                t
             }
-            None => {
+            _ => {
                 consecutive_parse_failures += 1;
                 if consecutive_parse_failures >= 3 {
                     eprintln!(
                         "{}",
-                        " Agent repeatedly failed to produce valid JSON actions; stopping."
+                        " Agent repeatedly failed to produce a valid turn; stopping."
                             .red()
                             .bold()
                     );
                     return Ok(());
                 }
                 history.push_bare_observation(
-                    "Observation: Your previous response was not valid JSON matching the required shape. \
-                    Respond with ONLY the JSON object, nothing else.",
+                    "Observation: Your previous response was not valid JSON matching the required \
+                    {\"thought\": ..., \"actions\": [...]} shape, or \"actions\" was empty. \
+                    Respond with ONLY the JSON object, nothing else, and include at least one action.",
                 );
                 continue;
             }
         };
 
-        if let Some(t) = &action.thought {
+        // --- Validate the turn before executing anything in it ---
+        let final_count = turn
+            .actions
+            .iter()
+            .filter(|a| a.action == "final_answer")
+            .count();
+        let write_count = turn
+            .actions
+            .iter()
+            .filter(|a| a.action == "write_file_edits")
+            .count();
+        let run_count = turn
+            .actions
+            .iter()
+            .filter(|a| a.action == "run_command")
+            .count();
+
+        if turn.actions.len() > MAX_ACTIONS_PER_TURN {
+            history.push_bare_observation(&format!(
+                "Observation: You proposed {} actions in one turn; the maximum is {}. \
+                Split this into smaller turns.",
+                turn.actions.len(),
+                MAX_ACTIONS_PER_TURN
+            ));
+            continue;
+        }
+        if final_count > 0 && turn.actions.len() > 1 {
+            history.push_bare_observation(
+                "Observation: final_answer must be the ONLY action in its turn. \
+                This turn was rejected — nothing in it was executed. Call final_answer \
+                alone once you're ready to answer.",
+            );
+            continue;
+        }
+        if write_count > 1 {
+            history.push_bare_observation(
+                "Observation: write_file_edits may appear at most once per turn — combine \
+                all your edits into that single call's \"edits\" array instead. \
+                This turn was rejected — nothing in it was executed.",
+            );
+            continue;
+        }
+        if run_count > 1 {
+            history.push_bare_observation(
+                "Observation: run_command may appear at most once per turn. \
+                This turn was rejected — nothing in it was executed.",
+            );
+            continue;
+        }
+
+        if let Some(t) = &turn.thought {
             if !t.trim().is_empty() {
                 println!("  {} {}", "Thought:".dimmed(), t.dimmed());
             }
         }
+        let thought = turn.thought.clone().unwrap_or_default();
 
-        let thought = action.thought.clone().unwrap_or_default();
-        let action_name = action.action.clone();
-        let action_input = action.action_input.clone();
+        if turn.actions.len() > 1 {
+            println!(
+                "  {}",
+                format!("(batched turn: {} actions)", turn.actions.len()).dimmed()
+            );
+        }
 
-        match action.action.as_str() {
-            "final_answer" => {
-                let answer = action
-                    .action_input
-                    .get("answer")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(no answer text provided)");
-                println!("\n{}", "Final answer:".bold().green());
-                println!("{}", answer);
-                return Ok(());
-            }
-            "search_codebase" => {
-                let query = action
-                    .action_input
-                    .get("query")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                println!("  {} search_codebase(\"{}\")", "Action:".cyan(), query);
-                let obs = tool_search_codebase(query, index, file_path_field, content_field);
-                let no_results = obs.contains("No results found");
+        // --- Execute every action in this turn, in order ---
+        for proposed in &turn.actions {
+            let action_name = proposed.action.clone();
+            let action_input = proposed.action_input.clone();
 
-                consecutive_search_count += 1;
-                history.record_step(thought, action_name, action_input, obs);
-
-                if consecutive_search_count >= 3 {
-                    if no_results {
-                        history.push_bare_observation(
-                            "Observation: You have searched 3 times in a row with no results. \
-                            Stop searching with these terms. Either try ONE very different, \
-                            broader keyword (e.g. a likely function or struct name), or — if you \
-                            genuinely cannot find relevant code — call final_answer explaining \
-                            that you could not locate this in the codebase.",
-                        );
-                    } else {
-                        history.push_bare_observation(
-                            "Observation: You have called search_codebase 3 times in a row. \
-                            You already have file matches from earlier searches above — pick the \
-                            most relevant FILE path shown and call read_file on it now to see the \
-                            actual implementation before doing anything else. Do not call \
-                            search_codebase again this step.",
-                        );
-                    }
-                    consecutive_search_count = 0;
+            match action_name.as_str() {
+                "final_answer" => {
+                    let answer = action_input
+                        .get("answer")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no answer text provided)");
+                    println!("\n{}", "Final answer:".bold().green());
+                    println!("{}", answer);
+                    return Ok(());
                 }
-            }
-            "read_file" => {
-                consecutive_search_count = 0;
-                let path = action
-                    .action_input
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let start = action
-                    .action_input
-                    .get("start_line")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as usize;
-                let end = action
-                    .action_input
-                    .get("end_line")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or((start + 100) as u64) as usize;
-                println!(
-                    "  {} read_file(\"{}\", {}, {})",
-                    "Action:".cyan(),
-                    path,
-                    start,
-                    end
-                );
-                let obs = tool_read_file(target_dir, path, start, end);
-                history.record_step(thought, action_name, action_input, obs);
-            }
-            "list_directory" => {
-                consecutive_search_count = 0;
-                let path = action
-                    .action_input
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(".");
-                println!("  {} list_directory(\"{}\")", "Action:".cyan(), path);
-                let obs = tool_list_directory(target_dir, path);
-                history.record_step(thought, action_name, action_input, obs);
-            }
-            "run_command" => {
-                consecutive_search_count = 0;
-                let cmd = action
-                    .action_input
-                    .get("cmd")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let obs = if cmd.trim().is_empty() {
-                    "Error: no command provided.".to_string()
-                } else {
-                    let result = tool_run_command(target_dir, cmd).await;
-                    format!(
-                        "({}):\n{}",
-                        if result.success { "success" } else { "failed" },
-                        result.text
-                    )
-                };
-                history.record_step(thought, action_name, action_input, obs);
-            }
-            "write_file_edits" if allow_write => {
-                consecutive_search_count = 0;
-                let edits_val = action
-                    .action_input
-                    .get("edits")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Array(vec![]));
-                let edits = parse_edit_blocks_from_value(&edits_val);
-                let (mut obs, applied) = propose_and_apply_edits(edits, target_dir);
-                println!("  {} {}", "Observation:".dimmed(), obs.dimmed());
+                "search_codebase" => {
+                    let query = action_input
+                        .get("query")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    println!("  {} search_codebase(\"{}\")", "Action:".cyan(), query);
+                    let obs = tool_search_codebase(query, index, file_path_field, content_field);
+                    let no_results = obs.contains("No results found");
 
-                if applied {
-                    if let Some(build_cmd) = detect_build_command(target_dir) {
-                        if build_retry_count < MAX_EDIT_BUILD_RETRIES {
-                            println!(
-                                "{}",
-                                format!(" Verifying with build/test check: {}", build_cmd).cyan()
+                    consecutive_search_count += 1;
+                    history.record_step(thought.clone(), action_name, action_input, obs);
+
+                    if consecutive_search_count >= 3 {
+                        if no_results {
+                            history.push_bare_observation(
+                                "Observation: You have searched 3 times in a row with no results. \
+                                Stop searching with these terms. Either try ONE very different, \
+                                broader keyword, or call final_answer explaining that you could \
+                                not locate this in the codebase.",
                             );
-                            let result = tool_run_command(target_dir, &build_cmd).await;
-                            build_retry_count += 1;
-
-                            if result.success {
-                                obs.push_str(&format!(
-                                    "\nBuild check '{}', attempt {}/{}: PASSED.\n{}",
-                                    build_cmd,
-                                    build_retry_count,
-                                    MAX_EDIT_BUILD_RETRIES,
-                                    result.text
-                                ));
-                                println!("{}", " Build/test check passed.".green());
-                            } else {
-                                obs.push_str(&format!(
-                                    "\nBuild check '{}', attempt {}/{}: FAILED.\n{}\n\
-                                    Please analyze this error and propose a fix using write_file_edits, \
-                                    or call final_answer explaining the issue if you cannot resolve it.",
-                                    build_cmd, build_retry_count, MAX_EDIT_BUILD_RETRIES, result.text
-                                ));
-                                println!(
-                                    "{}",
-                                    " Build/test check failed; feeding error back to the agent."
-                                        .yellow()
-                                );
-                            }
                         } else {
-                            obs.push_str(
-                                "\nMaximum build/test retry attempts reached; not running the build check again.",
+                            history.push_bare_observation(
+                                "Observation: You have called search_codebase 3 times in a row. \
+                                Pick the most relevant FILE path shown above and call read_file \
+                                on it now — you can batch this with your remaining searches in \
+                                the same turn.",
                             );
                         }
+                        consecutive_search_count = 0;
                     }
                 }
+                "read_file" => {
+                    consecutive_search_count = 0;
+                    let path = action_input
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let start = action_input
+                        .get("start_line")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(1) as usize;
+                    let end = action_input
+                        .get("end_line")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or((start + 100) as u64) as usize;
+                    println!(
+                        "  {} read_file(\"{}\", {}, {})",
+                        "Action:".cyan(),
+                        path,
+                        start,
+                        end
+                    );
+                    let obs = tool_read_file(target_dir, path, start, end);
+                    history.record_step(thought.clone(), action_name, action_input, obs);
+                }
+                "list_directory" => {
+                    consecutive_search_count = 0;
+                    let path = action_input
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(".");
+                    println!("  {} list_directory(\"{}\")", "Action:".cyan(), path);
+                    let obs = tool_list_directory(target_dir, path);
+                    history.record_step(thought.clone(), action_name, action_input, obs);
+                }
+                "run_command" => {
+                    consecutive_search_count = 0;
+                    let cmd = action_input
+                        .get("cmd")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let obs = if cmd.trim().is_empty() {
+                        "Error: no command provided.".to_string()
+                    } else {
+                        let result = tool_run_command(target_dir, cmd).await;
+                        format!(
+                            "({}):\n{}",
+                            if result.success { "success" } else { "failed" },
+                            result.text
+                        )
+                    };
+                    history.record_step(thought.clone(), action_name, action_input, obs);
+                }
+                "write_file_edits" if allow_write => {
+                    consecutive_search_count = 0;
+                    let edits_val = action_input
+                        .get("edits")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Array(vec![]));
+                    let edits = parse_edit_blocks_from_value(&edits_val);
+                    let (mut obs, applied) = propose_and_apply_edits(edits, target_dir);
+                    println!("  {} {}", "Observation:".dimmed(), obs.dimmed());
 
-                history.record_step(thought, action_name, action_input, obs);
-            }
-            other => {
-                consecutive_search_count = 0;
-                let obs = format!(
-                    "Unknown action '{}'. Choose one of the actions listed in the system prompt.",
-                    other
-                );
-                history.record_step(thought, action_name, action_input, obs);
+                    if applied {
+                        if let Some(build_cmd) = detect_build_command(target_dir) {
+                            if build_retry_count < MAX_EDIT_BUILD_RETRIES {
+                                println!(
+                                    "{}",
+                                    format!(" Verifying with build/test check: {}", build_cmd)
+                                        .cyan()
+                                );
+                                let result = tool_run_command(target_dir, &build_cmd).await;
+                                build_retry_count += 1;
+
+                                if result.success {
+                                    obs.push_str(&format!(
+                                        "\nBuild check '{}', attempt {}/{}: PASSED.\n{}",
+                                        build_cmd,
+                                        build_retry_count,
+                                        MAX_EDIT_BUILD_RETRIES,
+                                        result.text
+                                    ));
+                                    println!("{}", " Build/test check passed.".green());
+                                } else {
+                                    obs.push_str(&format!(
+                                        "\nBuild check '{}', attempt {}/{}: FAILED.\n{}\n\
+                                        Please analyze this error and propose a fix using write_file_edits, \
+                                        or call final_answer explaining the issue if you cannot resolve it.",
+                                        build_cmd, build_retry_count, MAX_EDIT_BUILD_RETRIES, result.text
+                                    ));
+                                    println!(
+                                        "{}",
+                                        " Build/test check failed; feeding error back to the agent.".yellow()
+                                    );
+                                }
+                            } else {
+                                obs.push_str(
+                                    "\nMaximum build/test retry attempts reached; not running the build check again.",
+                                );
+                            }
+                        }
+                    }
+
+                    history.record_step(thought.clone(), action_name, action_input, obs);
+                }
+                other => {
+                    consecutive_search_count = 0;
+                    let obs = format!(
+                        "Unknown action '{}'. Choose one of the actions listed in the system prompt.",
+                        other
+                    );
+                    history.record_step(thought.clone(), action_name, action_input, obs);
+                }
             }
         }
+
+        let _ = step; // step index used only for the progress message above
+        continue 'turns;
     }
 
     println!(
         "{}",
-        " Reached the maximum number of agent steps without a final answer.".yellow()
+        " Reached the maximum number of agent turns without a final answer.".yellow()
     );
     Ok(())
 }
@@ -1372,10 +1480,12 @@ async fn run_edit_agent_pipeline(
     let goal = format!(
         "Modify the codebase to satisfy the following instruction. Investigate with \
         search_codebase / read_file / list_directory first so your edits are grounded in the \
-        real file contents, then use write_file_edits to apply changes. After edits are applied \
-        you will automatically be shown the result of the project's build/test check — if it \
-        fails, analyze the error and propose a fix. Call final_answer once the change is \
-        complete (or once you've made a best effort and should report status/blockers).\n\n\
+        real file contents. If the directory is empty or the relevant files don't exist yet, \
+        don't keep re-listing it — go straight to write_file_edits with mode \"create\" to \
+        author the needed files. After edits are applied you will automatically be shown the \
+        result of the project's build/test check — if it fails, analyze the error and propose \
+        a fix. Call final_answer once the change is complete (or once you've made a best effort \
+        and should report status/blockers).\n\n\
         INSTRUCTION:\n{}",
         instruction
     );
@@ -1414,7 +1524,7 @@ async fn run_one_shot_ask_pipeline(
 
     println!("{}", "Sending one-shot query to LLM...".cyan());
 
-    let response = call_gemini_once(model, prompt).await?;
+    let response = call_gemini_once(model, prompt, None).await?;
 
     println!("\n{}", "Answer:".bold().green());
     println!("{}", response);
@@ -1448,15 +1558,21 @@ async fn run_one_shot_edit_pipeline(
         =======\n\
         new replacement text\n\
         >>>>>>> REPLACE\n\n\
+        To CREATE a brand new file, leave the SEARCH section empty and put the full file contents in REPLACE:\n\
+        FILE: path/to/new_file.ext\n\
+        <<<<<<< SEARCH\n\
+        =======\n\
+        full contents of the new file\n\
+        >>>>>>> REPLACE\n\n\
         Important:\n\
-        - The SEARCH block must match existing code EXACTLY line-by-line.\n\
+        - The SEARCH block must match existing code EXACTLY line-by-line (or be empty, for new files).\n\
         - Output ONLY the edit blocks. No conversational text.",
         instruction, codebase_context
     );
 
     let use_gemini = provider.to_lowercase() == "gemini" || model.contains("gemini");
     let response = if use_gemini {
-        call_gemini_once(model, prompt).await?
+        call_gemini_once(model, prompt, None).await?
     } else {
         call_ollama_once(model, prompt, None).await?
     };
@@ -1663,10 +1779,15 @@ fn parse_edit_blocks(raw_text: &str) -> Vec<EditBlock> {
             replace_lines.clear();
         } else if line.starts_with(">>>>>>> REPLACE") {
             in_replace = false;
-            if !current_file.is_empty() && !search_lines.is_empty() {
+            if !current_file.is_empty() && !replace_lines.is_empty() {
+                let mode = if search_lines.is_empty() {
+                    EditMode::Create
+                } else {
+                    EditMode::Replace
+                };
                 blocks.push(EditBlock {
                     file_path: current_file.clone(),
-                    mode: EditMode::Replace,
+                    mode,
                     search: search_lines.join("\n"),
                     replace: replace_lines.join("\n"),
                 });
