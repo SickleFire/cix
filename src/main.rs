@@ -620,10 +620,10 @@ fn parse_edit_blocks_from_value(v: &serde_json::Value) -> Vec<EditBlock> {
                 .get("mode")
                 .and_then(|m| m.as_str())
                 .unwrap_or("replace");
-            let mode = if mode_str == "append" {
-                EditMode::Append
-            } else {
-                EditMode::Replace
+            let mode = match mode_str {
+                "append" => EditMode::Append,
+                "create" => EditMode::Create,
+                _ => EditMode::Replace,
             };
             let search = item
                 .get("search")
@@ -668,11 +668,25 @@ fn propose_and_apply_edits(edits: Vec<EditBlock>, target_dir: &str) -> (String, 
     let mut skip_notes = Vec::new();
 
     for block in edits {
-        let resolved = match resolve_file_path(&block.file_path, target_dir) {
-            Some(p) => p,
-            None => {
-                skip_notes.push(format!("file not found: {}", block.file_path));
-                continue;
+        let resolved = match block.mode {
+            EditMode::Create => match resolve_new_file_path(&block.file_path, target_dir) {
+                Some(p) => p,
+                None => {
+                    skip_notes.push(format!(
+                        "cannot create {}: a file already exists at that path (use replace/append instead)",
+                        block.file_path
+                    ));
+                    continue;
+                }
+            },
+            EditMode::Replace | EditMode::Append => {
+                match resolve_file_path(&block.file_path, target_dir) {
+                    Some(p) => p,
+                    None => {
+                        skip_notes.push(format!("file not found: {}", block.file_path));
+                        continue;
+                    }
+                }
             }
         };
 
@@ -727,6 +741,12 @@ fn propose_and_apply_edits(edits: Vec<EditBlock>, target_dir: &str) -> (String, 
                     println!("  {}", format!("+ {}", line).green());
                 }
             }
+            EditMode::Create => {
+                println!("  {}", "(creating new file)".dimmed());
+                for line in block.replace.lines() {
+                    println!("  {}", format!("+ {}", line).green());
+                }
+            }
         }
     }
     println!(
@@ -777,8 +797,8 @@ fn build_tools_description(allow_write: bool) -> String {
     );
     if allow_write {
         desc.push_str(
-            "- write_file_edits: action_input {\"edits\": [{\"file_path\": \"...\", \"mode\": \"replace\"|\"append\", \"search\": \"...\", \"replace\": \"...\"}]} — propose edits to apply to disk. \
-            For \"replace\", \"search\" must be copied verbatim from a file you have actually read or retrieved. For \"append\", omit or empty \"search\". The user will be asked to confirm before anything is written.\n",
+            "- write_file_edits: action_input {\"edits\": [{\"file_path\": \"...\", \"mode\": \"replace\"|\"append\"|\"create\", \"search\": \"...\", \"replace\": \"...\"}]} — propose edits to apply to disk. \
+For \"replace\", \"search\" must be copied verbatim from a file you have actually read or retrieved. For \"append\" or \"create\", omit or empty \"search\" (for \"create\", \"replace\" holds the full contents of the new file, and \"file_path\" must not already exist). The user will be asked to confirm before anything is written.\n",
         );
     }
     desc.push_str(
@@ -789,6 +809,239 @@ fn build_tools_description(allow_write: bool) -> String {
 
 const MAX_AGENT_STEPS: usize = 12;
 const MAX_EDIT_BUILD_RETRIES: usize = 3;
+
+#[derive(Debug, Clone)]
+struct AgentStep {
+    step_number: usize,
+    thought: String,
+    action: String,
+    action_input: serde_json::Value,
+    observation: String,
+}
+
+impl AgentStep {
+    /// Renders a step exactly as it appeared in the old flat scratchpad, so the model
+    /// sees a familiar transcript format regardless of how it's stored internally.
+    fn render(&self) -> String {
+        format!(
+            "Thought: {}\nAction: {}\nAction Input: {}\nObservation:\n{}\n",
+            self.thought, self.action, self.action_input, self.observation
+        )
+    }
+
+    /// A compact one-line form used once a step ages out of the verbatim window,
+    /// so it can still be swept into the periodic summary.
+    fn render_compact(&self) -> String {
+        let obs_preview: String = self.observation.chars().take(200).collect();
+        let truncated = self.observation.chars().count() > 200;
+        format!(
+            "Step {}: action={} input={} -> {}{}",
+            self.step_number,
+            self.action,
+            self.action_input,
+            obs_preview.replace('\n', " "),
+            if truncated { " [...]" } else { "" }
+        )
+    }
+}
+
+/// Bounded, structured replacement for the flat `scratchpad: String`.
+///
+/// Keeps the most recent `MAX_VERBATIM_STEPS` steps in full (thought + action +
+/// full observation, exactly as the model needs them for near-term reasoning),
+/// and periodically folds everything older than that into `summary` — a running,
+/// human/LLM-authored recap — so the rendered transcript stays roughly bounded in
+/// size no matter how many steps the agent takes.
+struct AgentHistory {
+    steps: Vec<AgentStep>,
+    summary: String,
+    next_step_number: usize,
+    /// Number of steps folded into `summary` since the last summarization pass,
+    /// used to decide when it's worth paying for another summarization call.
+    steps_since_summary: usize,
+}
+
+/// How many of the most recent steps are always kept verbatim (full observations).
+/// Chosen to comfortably cover the model's typical "what did I just learn" lookback
+/// without keeping e.g. full 400-line file reads from 20 steps ago in every prompt.
+const MAX_VERBATIM_STEPS: usize = 6;
+
+/// Once more than this many steps have aged out of the verbatim window since the
+/// last summarization pass, collapse them. Avoids re-summarizing on every single
+/// step (which would add an extra model call per turn).
+const SUMMARIZE_EVERY_N_STEPS: usize = 4;
+
+impl AgentHistory {
+    fn new() -> Self {
+        Self {
+            steps: Vec::new(),
+            summary: String::new(),
+            next_step_number: 1,
+            steps_since_summary: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.steps.is_empty() && self.summary.is_empty()
+    }
+
+    /// Records a completed step. Call once per agent turn, after the tool has run
+    /// and you have its observation text in hand.
+    fn record_step(
+        &mut self,
+        thought: String,
+        action: String,
+        action_input: serde_json::Value,
+        observation: String,
+    ) {
+        self.steps.push(AgentStep {
+            step_number: self.next_step_number,
+            thought,
+            action,
+            action_input,
+            observation,
+        });
+        self.next_step_number += 1;
+    }
+
+    /// Appends a bare observation to the most recently recorded step (used for the
+    /// "invalid JSON, try again" and similar meta-observations that don't map to a
+    /// real tool call). Falls back to a synthetic step if history is empty.
+    fn push_bare_observation(&mut self, observation: &str) {
+        if let Some(last) = self.steps.last_mut() {
+            last.observation.push('\n');
+            last.observation.push_str(observation);
+        } else {
+            self.record_step(
+                String::new(),
+                "(none)".to_string(),
+                serde_json::Value::Null,
+                observation.to_string(),
+            );
+        }
+    }
+
+    /// Folds steps older than the verbatim window into `summary`. Uses a cheap
+    /// heuristic compaction by default; if `use_llm` is true and enough steps have
+    /// accumulated, asks the model itself to write a proper running summary instead
+    /// (higher quality, costs one extra call — only triggered every
+    /// `SUMMARIZE_EVERY_N_STEPS` steps, not every turn).
+    async fn maybe_summarize(&mut self, use_gemini: bool, model: &str) {
+        if self.steps.len() <= MAX_VERBATIM_STEPS {
+            return;
+        }
+
+        let overflow = self.steps.len() - MAX_VERBATIM_STEPS;
+        self.steps_since_summary += overflow.saturating_sub(
+            self.steps
+                .len()
+                .saturating_sub(MAX_VERBATIM_STEPS + self.steps_since_summary),
+        );
+
+        if overflow < SUMMARIZE_EVERY_N_STEPS && !self.summary.is_empty() {
+            // Not enough new overflow yet to be worth re-summarizing; just compact
+            // the extra steps heuristically so the transcript doesn't keep growing
+            // between summarization passes.
+            self.compact_overflow_heuristically(overflow);
+            return;
+        }
+
+        let to_fold: Vec<&AgentStep> = self.steps[..overflow].iter().collect();
+        let folded_text: String = to_fold
+            .iter()
+            .map(|s| s.render_compact())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let new_summary = match self
+            .try_llm_summarize(use_gemini, model, &folded_text)
+            .await
+        {
+            Some(s) => s,
+            None => {
+                // LLM summarization unavailable/failed: fall back to heuristic
+                // concatenation so we still bound growth without losing the run.
+                format!(
+                    "{}{}{}",
+                    self.summary,
+                    if self.summary.is_empty() { "" } else { "\n" },
+                    folded_text
+                )
+            }
+        };
+
+        self.summary = new_summary;
+        self.steps.drain(..overflow);
+        self.steps_since_summary = 0;
+    }
+
+    /// Cheap fallback: just trims older observations down to their compact form
+    /// in place, without an extra model call. Used between full summarization passes.
+    fn compact_overflow_heuristically(&mut self, overflow: usize) {
+        for step in self.steps.iter_mut().take(overflow) {
+            if step.observation.chars().count() > 200 {
+                let preview: String = step.observation.chars().take(200).collect();
+                step.observation = format!("{} [...truncated, see summary...]", preview);
+            }
+        }
+    }
+
+    /// Asks the model to condense the given block of aged-out steps into a short
+    /// running summary, merged with the existing summary. Returns `None` on any
+    /// failure so the caller can fall back to heuristic compaction instead of
+    /// derailing the agent loop over a summarization hiccup.
+    async fn try_llm_summarize(
+        &self,
+        use_gemini: bool,
+        model: &str,
+        folded_text: &str,
+    ) -> Option<String> {
+        let prompt = format!(
+            "Condense the following agent history into a short running summary (max ~150 words). \
+            Preserve concrete facts the agent will still need: file paths touched, key findings from \
+            search/read actions, build/test results, and any decisions made. Drop routine tool-call noise.\n\n\
+            EXISTING SUMMARY:\n{}\n\n\
+            NEW STEPS TO FOLD IN:\n{}\n\n\
+            Respond with ONLY the updated summary text, no preamble.",
+            if self.summary.is_empty() {
+                "(none yet)"
+            } else {
+                &self.summary
+            },
+            folded_text
+        );
+
+        let result = if use_gemini {
+            call_gemini_once(model, prompt).await
+        } else {
+            call_ollama_once(model, prompt, None).await
+        };
+
+        result
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Renders the full transcript block to inject into the next prompt: the running
+    /// summary (if any) followed by the verbatim recent steps.
+    fn render(&self) -> String {
+        if self.is_empty() {
+            return "(nothing yet — this is your first step)".to_string();
+        }
+
+        let mut out = String::new();
+        if !self.summary.is_empty() {
+            out.push_str("Summary of earlier steps:\n");
+            out.push_str(&self.summary);
+            out.push_str("\n\n---\n\n");
+        }
+        for step in &self.steps {
+            out.push_str(&step.render());
+        }
+        out
+    }
+}
 
 /// The shared ReAct-style agent loop used by both `cix ask` and `cix edit`. At each step the
 /// model is given the accumulated Thought/Action/Observation transcript and must respond with
@@ -825,19 +1078,19 @@ async fn run_agent_loop(
         goal_description, tools_desc
     );
 
-    let mut scratchpad = String::new();
+    let mut history = AgentHistory::new();
     let mut build_retry_count = 0usize;
     let mut consecutive_parse_failures = 0usize;
 
     for step in 1..=MAX_AGENT_STEPS {
-        let history = if scratchpad.is_empty() {
-            "(nothing yet — this is your first step)"
-        } else {
-            &scratchpad
-        };
+        // Fold aged-out steps into the running summary (no-op until enough steps
+        // have accumulated), then render the bounded transcript for the prompt.
+        history.maybe_summarize(use_gemini, model).await;
+        let transcript = history.render();
+
         let prompt = format!(
             "{}\n\nTranscript so far:\n{}\n\nWhat is your next action? Respond with ONLY the JSON object.",
-            system_preamble, history
+            system_preamble, transcript
         );
 
         println!(
@@ -878,9 +1131,9 @@ async fn run_agent_loop(
                     );
                     return Ok(());
                 }
-                scratchpad.push_str(
+                history.push_bare_observation(
                     "Observation: Your previous response was not valid JSON matching the required shape. \
-                    Respond with ONLY the JSON object, nothing else.\n",
+                    Respond with ONLY the JSON object, nothing else.",
                 );
                 continue;
             }
@@ -892,12 +1145,11 @@ async fn run_agent_loop(
             }
         }
 
-        scratchpad.push_str(&format!(
-            "Thought: {}\nAction: {}\nAction Input: {}\n",
-            action.thought.clone().unwrap_or_default(),
-            action.action,
-            action.action_input
-        ));
+        // Captured now so we can hand them to `history.record_step(...)` once we
+        // have the observation, instead of writing straight into a flat buffer.
+        let thought = action.thought.clone().unwrap_or_default();
+        let action_name = action.action.clone();
+        let action_input = action.action_input.clone();
 
         match action.action.as_str() {
             "final_answer" => {
@@ -918,7 +1170,7 @@ async fn run_agent_loop(
                     .unwrap_or("");
                 println!("  {} search_codebase(\"{}\")", "Action:".cyan(), query);
                 let obs = tool_search_codebase(query, index, file_path_field, content_field);
-                scratchpad.push_str(&format!("Observation:\n{}\n", obs));
+                history.record_step(thought, action_name, action_input, obs);
             }
             "read_file" => {
                 let path = action
@@ -944,7 +1196,7 @@ async fn run_agent_loop(
                     end
                 );
                 let obs = tool_read_file(target_dir, path, start, end);
-                scratchpad.push_str(&format!("Observation:\n{}\n", obs));
+                history.record_step(thought, action_name, action_input, obs);
             }
             "list_directory" => {
                 let path = action
@@ -954,7 +1206,7 @@ async fn run_agent_loop(
                     .unwrap_or(".");
                 println!("  {} list_directory(\"{}\")", "Action:".cyan(), path);
                 let obs = tool_list_directory(target_dir, path);
-                scratchpad.push_str(&format!("Observation:\n{}\n", obs));
+                history.record_step(thought, action_name, action_input, obs);
             }
             "run_command" => {
                 let cmd = action
@@ -962,16 +1214,17 @@ async fn run_agent_loop(
                     .get("cmd")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if cmd.trim().is_empty() {
-                    scratchpad.push_str("Observation: Error: no command provided.\n");
+                let obs = if cmd.trim().is_empty() {
+                    "Error: no command provided.".to_string()
                 } else {
                     let result = tool_run_command(target_dir, cmd).await;
-                    scratchpad.push_str(&format!(
-                        "Observation ({}):\n{}\n",
+                    format!(
+                        "({}):\n{}",
                         if result.success { "success" } else { "failed" },
                         result.text
-                    ));
-                }
+                    )
+                };
+                history.record_step(thought, action_name, action_input, obs);
             }
             "write_file_edits" if allow_write => {
                 let edits_val = action
@@ -980,9 +1233,8 @@ async fn run_agent_loop(
                     .cloned()
                     .unwrap_or(serde_json::Value::Array(vec![]));
                 let edits = parse_edit_blocks_from_value(&edits_val);
-                let (obs, applied) = propose_and_apply_edits(edits, target_dir);
+                let (mut obs, applied) = propose_and_apply_edits(edits, target_dir);
                 println!("  {} {}", "Observation:".dimmed(), obs.dimmed());
-                scratchpad.push_str(&format!("Observation: {}\n", obs));
 
                 if applied {
                     if let Some(build_cmd) = detect_build_command(target_dir) {
@@ -995,8 +1247,8 @@ async fn run_agent_loop(
                             build_retry_count += 1;
 
                             if result.success {
-                                scratchpad.push_str(&format!(
-                                    "Observation (build check '{}', attempt {}/{}): PASSED.\n{}\n",
+                                obs.push_str(&format!(
+                                    "\nBuild check '{}', attempt {}/{}: PASSED.\n{}",
                                     build_cmd,
                                     build_retry_count,
                                     MAX_EDIT_BUILD_RETRIES,
@@ -1004,10 +1256,10 @@ async fn run_agent_loop(
                                 ));
                                 println!("{}", " Build/test check passed.".green());
                             } else {
-                                scratchpad.push_str(&format!(
-                                    "Observation (build check '{}', attempt {}/{}): FAILED.\n{}\n\
+                                obs.push_str(&format!(
+                                    "\nBuild check '{}', attempt {}/{}: FAILED.\n{}\n\
                                     Please analyze this error and propose a fix using write_file_edits, \
-                                    or call final_answer explaining the issue if you cannot resolve it.\n",
+                                    or call final_answer explaining the issue if you cannot resolve it.",
                                     build_cmd, build_retry_count, MAX_EDIT_BUILD_RETRIES, result.text
                                 ));
                                 println!(
@@ -1017,18 +1269,21 @@ async fn run_agent_loop(
                                 );
                             }
                         } else {
-                            scratchpad.push_str(
-                                "Observation: Maximum build/test retry attempts reached; not running the build check again.\n",
+                            obs.push_str(
+                                "\nMaximum build/test retry attempts reached; not running the build check again.",
                             );
                         }
                     }
                 }
+
+                history.record_step(thought, action_name, action_input, obs);
             }
             other => {
-                scratchpad.push_str(&format!(
-                    "Observation: Unknown action '{}'. Choose one of the actions listed in the system prompt.\n",
+                let obs = format!(
+                    "Unknown action '{}'. Choose one of the actions listed in the system prompt.",
                     other
-                ));
+                );
+                history.record_step(thought, action_name, action_input, obs);
             }
         }
     }
@@ -1214,6 +1469,23 @@ async fn run_one_shot_edit_pipeline(
     Ok(())
 }
 
+fn resolve_new_file_path(proposed_path: &str, target_dir: &str) -> Option<std::path::PathBuf> {
+    let clean_proposed = proposed_path.trim_start_matches(r"\\?\").replace('\\', "/");
+    let path = std::path::Path::new(&clean_proposed);
+
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::path::Path::new(target_dir).join(&clean_proposed)
+    };
+
+    if candidate.exists() {
+        None // already exists — use "replace" or "append" instead of "create"
+    } else {
+        Some(candidate)
+    }
+}
+
 /// Executes the code search pipeline: queries the Tantivy index and displays matching
 /// code snippets with line numbers and context preview.
 fn run_search_pipeline(
@@ -1338,6 +1610,7 @@ struct EditBlock {
 enum EditMode {
     Replace,
     Append,
+    Create,
 }
 
 /// Parses marker-format SEARCH/REPLACE blocks from a text response. Kept for callers (and
@@ -1431,21 +1704,67 @@ fn apply_edit_blocks(
     let mut applied_count = 0;
 
     for block in blocks {
-        let file_path = match resolve_file_path(&block.file_path, target_dir) {
-            Some(p) => p,
-            None => {
-                eprintln!(
-                    "{}",
-                    format!(" Warning: File not found: {}", block.file_path).yellow()
-                );
-                continue;
+        let file_path = match block.mode {
+            EditMode::Create => match resolve_new_file_path(&block.file_path, target_dir) {
+                Some(p) => p,
+                None => {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            " Warning: refusing to create {} — already exists",
+                            block.file_path
+                        )
+                        .yellow()
+                    );
+                    continue;
+                }
+            },
+            EditMode::Replace | EditMode::Append => {
+                match resolve_file_path(&block.file_path, target_dir) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!(
+                            "{}",
+                            format!(" Warning: File not found: {}", block.file_path).yellow()
+                        );
+                        continue;
+                    }
+                }
             }
         };
 
-        let content = fs::read_to_string(&file_path)?;
-
         match block.mode {
+            EditMode::Create => {
+                if let Some(parent) = file_path.parent() {
+                    if let Err(e) = fs::create_dir_all(parent) {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                " Warning: could not create directory {}: {}",
+                                parent.display(),
+                                e
+                            )
+                            .yellow()
+                        );
+                        continue;
+                    }
+                }
+                let content = block.replace.replace("\r\n", "\n");
+                fs::write(&file_path, content)?;
+                applied_count += 1;
+            }
             EditMode::Replace => {
+                let content = match fs::read_to_string(&file_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!(
+                            "{}",
+                            format!(" Warning: could not read {}: {}", file_path.display(), e)
+                                .yellow()
+                        );
+                        continue;
+                    }
+                };
                 let normalized_content = content.replace("\r\n", "\n");
                 let normalized_search = block.search.replace("\r\n", "\n");
                 let normalized_replace = block.replace.replace("\r\n", "\n");
@@ -1475,6 +1794,17 @@ fn apply_edit_blocks(
                 applied_count += 1;
             }
             EditMode::Append => {
+                let content = match fs::read_to_string(&file_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!(
+                            "{}",
+                            format!(" Warning: could not read {}: {}", file_path.display(), e)
+                                .yellow()
+                        );
+                        continue;
+                    }
+                };
                 let normalized_replace = block.replace.replace("\r\n", "\n");
                 let separator = if content.is_empty() || content.ends_with('\n') {
                     ""
