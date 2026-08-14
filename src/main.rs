@@ -27,6 +27,11 @@ use tantivy::{Index, ReloadPolicy, TantivyDocument, Term, doc};
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
+/// When true, prints the raw parsed action_input for every executed action. Useful when
+/// diagnosing schema/parsing mismatches between what the model intends (per its `thought`)
+/// and what actually gets executed. Cheap enough to leave in permanently.
+const DEBUG_ACTIONS: bool = true;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "cix",
@@ -314,8 +319,31 @@ fn extract_keywords(question: &str) -> String {
 // used by both `cix ask` and `cix edit`.
 // =====================================================================================
 
-/// A single "next step" the agent model proposes. Every model turn must produce exactly
-/// one of these, encoded as a JSON object, with no other surrounding text.
+/// Raw shape of a single proposed action exactly as it comes off the wire. For Gemini,
+/// per `agent_action_schema()`, `action_input` is constrained to a STRING containing
+/// JSON-encoded arguments (Gemini's structured-output mode does not reliably support
+/// open/arbitrary-key nested objects — an object schema with no declared `properties`
+/// silently collapses to `{}` regardless of what the model intends). For Ollama, whose
+/// format-constrained decoding is looser, `action_input` may already arrive as a real
+/// object. This raw struct accepts either shape via `serde_json::Value` and
+/// `normalize_turn` sorts out which one it actually got.
+#[derive(Deserialize, Debug, Clone)]
+struct ProposedActionRaw {
+    action: String,
+    #[serde(default)]
+    action_input: serde_json::Value,
+}
+
+#[derive(Deserialize, Debug)]
+struct AgentTurnRaw {
+    #[serde(default)]
+    thought: Option<String>,
+    actions: Vec<ProposedActionRaw>,
+}
+
+/// A single "next step" the agent model proposes, normalized so `action_input` is always
+/// a real JSON object/value ready for `.get(...)` regardless of whether it arrived as a
+/// JSON-encoded string (Gemini) or a native object (Ollama).
 #[derive(Deserialize, Debug, Clone)]
 struct ProposedAction {
     action: String,
@@ -330,9 +358,46 @@ struct AgentTurn {
     actions: Vec<ProposedAction>,
 }
 
-/// JSON schema used to constrain Ollama's decoding for the agent loop so the response can
-/// only ever be `{thought?, action, action_input}` — no prose, no markdown fences, no
-/// half-finished JSON.
+/// Normalizes a raw parsed turn into the shape the loop uses. If `action_input` came back
+/// as a JSON string (the Gemini case, forced by the schema below), parse it a second time
+/// into a real value. If it's already an object (the Ollama case), pass it through as-is.
+/// If the string fails to parse as JSON, it's kept as a raw string value so at least the
+/// content isn't silently dropped — downstream `.get("path")` calls will just miss, and
+/// the resulting tool error will show the model what it actually sent.
+fn normalize_turn(raw: AgentTurnRaw) -> AgentTurn {
+    let actions = raw
+        .actions
+        .into_iter()
+        .map(|a| {
+            let input = match a.action_input {
+                serde_json::Value::String(s) => {
+                    serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s))
+                }
+                other => other,
+            };
+            ProposedAction {
+                action: a.action,
+                action_input: input,
+            }
+        })
+        .collect();
+    AgentTurn {
+        thought: raw.thought,
+        actions,
+    }
+}
+
+/// JSON schema used to constrain Gemini's decoding for the agent loop so the response can
+/// only ever be `{thought?, actions: [{action, action_input}, ...]}` — no prose, no
+/// markdown fences, no half-finished JSON.
+///
+/// IMPORTANT: `action_input` is deliberately typed as a STRING (containing JSON-encoded
+/// arguments), not a nested `object`. Gemini's `responseSchema` does not reliably support
+/// open/arbitrary-key objects — an `object` schema with no declared `properties` tends to
+/// collapse to `{}` at decode time regardless of what the model is trying to say, which
+/// silently drops every argument (this was the root cause of read_file always receiving
+/// an empty path). Routing arguments through a string field sidesteps that limitation;
+/// `normalize_turn` parses the string back into a real value afterward.
 fn agent_action_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -346,7 +411,10 @@ fn agent_action_schema() -> serde_json::Value {
                     "type": "object",
                     "properties": {
                         "action": { "type": "string" },
-                        "action_input": { "type": "object" }
+                        "action_input": {
+                            "type": "string",
+                            "description": "A JSON-ENCODED STRING (not a nested object) containing this action's arguments, e.g. \"{\\\"path\\\": \\\"index.html\\\", \\\"start_line\\\": 1, \\\"end_line\\\": 100}\". Must parse as valid JSON."
+                        }
                     },
                     "required": ["action", "action_input"]
                 }
@@ -503,11 +571,25 @@ fn tool_search_codebase(
 
 /// Tool: `read_file(path, start_line, end_line)`. Reads a specific, bounded line range from
 /// a file so the agent can pull precise context without re-reading whole files.
-fn tool_read_file(target_dir: &str, path: &str, start_line: usize, end_line: usize) -> String {
+///
+/// `raw_input` is the full `action_input` value as received (post-normalization), used only
+/// to echo back exactly what the model sent when `path` is empty, so a model that used the
+/// wrong field name (e.g. `file_path` instead of `path`) can see the mismatch itself instead
+/// of retrying the same broken call indefinitely.
+fn tool_read_file(
+    target_dir: &str,
+    path: &str,
+    start_line: usize,
+    end_line: usize,
+    raw_input: &serde_json::Value,
+) -> String {
     if path.trim().is_empty() {
-        return "Error: read_file requires a non-empty \"path\" (e.g. the exact path shown by \
-                list_directory, such as \"index.html\"). No path was provided in action_input."
-            .to_string();
+        return format!(
+            "Error: read_file requires a non-empty \"path\" (e.g. the exact path shown by \
+            list_directory, such as \"index.html\"). You sent action_input: {}. The field \
+            must be named \"path\" — \"file_path\" is only used by write_file_edits.",
+            raw_input
+        );
     }
     let resolved = match resolve_file_path(path, target_dir) {
         Some(p) => p,
@@ -844,19 +926,21 @@ fn build_tools_description(allow_write: bool) -> String {
         list_directory may appear more than once per turn. run_command and \
         write_file_edits may each appear AT MOST ONCE per turn. final_answer, if used, \
         must be the ONLY action in its turn.\n\n\
-        - search_codebase: action_input {\"query\": \"<search terms>\"} — full-text search the indexed codebase.\n\
-        - read_file: action_input {\"path\": \"<file path>\", \"start_line\": <int>, \"end_line\": <int>} — read a bounded line range from a file.\n\
-        - list_directory: action_input {\"path\": \"<relative dir path, use '.' for root>\"} — list files/subdirectories.\n\
-        - run_command: action_input {\"cmd\": \"<shell command>\"} — run a shell command in the project root (e.g. to inspect the project or run tests).\n",
+        NOTE: \"action_input\" must be a JSON-ENCODED STRING containing the arguments \
+        object, not a nested object. For example: \"action_input\": \"{\\\"path\\\": \\\"index.html\\\", \\\"start_line\\\": 1, \\\"end_line\\\": 100}\".\n\n\
+        - search_codebase: arguments {\"query\": \"<search terms>\"} — full-text search the indexed codebase.\n\
+        - read_file: arguments {\"path\": \"<file path>\", \"start_line\": <int>, \"end_line\": <int>} — read a bounded line range from a file. The field is \"path\", not \"file_path\".\n\
+        - list_directory: arguments {\"path\": \"<relative dir path, use '.' for root>\"} — list files/subdirectories.\n\
+        - run_command: arguments {\"cmd\": \"<shell command>\"} — run a shell command in the project root (e.g. to inspect the project or run tests).\n",
     );
     if allow_write {
         desc.push_str(
-            "- write_file_edits: action_input {\"edits\": [{\"file_path\": \"...\", \"mode\": \"replace\"|\"append\"|\"create\", \"search\": \"...\", \"replace\": \"...\"}]} — propose edits to apply to disk. \
-For \"replace\", \"search\" must be copied verbatim from a file you have actually read or retrieved. For \"append\" or \"create\", omit or empty \"search\" (for \"create\", \"replace\" holds the full contents of the new file, and \"file_path\" must not already exist). The user will be asked to confirm before anything is written.\n",
+            "- write_file_edits: arguments {\"edits\": [{\"file_path\": \"...\", \"mode\": \"replace\"|\"append\"|\"create\", \"search\": \"...\", \"replace\": \"...\"}]} — propose edits to apply to disk. \
+For \"replace\", \"search\" must be copied verbatim from a file you have actually read or retrieved. For \"append\" or \"create\", omit or empty \"search\" (for \"create\", \"replace\" holds the full contents of the new file, and \"file_path\" must not already exist). The user will be asked to confirm before anything is written. Note this action uses \"file_path\" inside each edit entry — that name does NOT apply to read_file.\n",
         );
     }
     desc.push_str(
-        "- final_answer: action_input {\"answer\": \"<your final answer or summary to the user>\"} — call this ALONE, with nothing else in \"actions\", once you have nothing further to investigate or change.\n",
+        "- final_answer: arguments {\"answer\": \"<your final answer or summary to the user>\"} — call this ALONE, with nothing else in \"actions\", once you have nothing further to investigate or change.\n",
     );
     desc
 }
@@ -1066,8 +1150,11 @@ impl AgentHistory {
             folded_text
         );
 
+        // Note: summarization is a free-form text task, not an agent "next action" turn,
+        // so it deliberately does NOT pass agent_action_schema() here — that schema is
+        // specific to the {thought, actions:[...]} contract used by the main loop.
         let result = if use_gemini {
-            call_gemini_once(model, prompt, Some(agent_action_schema())).await
+            call_gemini_once(model, prompt, None).await
         } else {
             call_ollama_once(model, prompt, None).await
         };
@@ -1100,8 +1187,8 @@ impl AgentHistory {
 
 /// The shared ReAct-style agent loop used by both `cix ask` and `cix edit`. At each step the
 /// model is given the accumulated Thought/Action/Observation transcript and must respond with
-/// exactly one JSON `AgentAction`. The loop executes the requested tool, appends the result as
-/// an Observation, and repeats until the model calls `final_answer` or the step budget runs out.
+/// exactly one JSON turn. The loop executes the requested tool(s), appends the result as an
+/// Observation, and repeats until the model calls `final_answer` or the step budget runs out.
 ///
 /// When `allow_write` is true (the `edit` case), a successful `write_file_edits` call is
 /// automatically followed by the project's detected build/test command; a failure is fed back
@@ -1127,7 +1214,7 @@ async fn run_agent_loop(
         "You are an autonomous coding agent working inside a codebase.\n\n\
         GOAL:\n{}\n\n\
         Proceed step by step. At EVERY turn, respond with ONLY a single JSON object of the shape \
-        {{\"thought\": \"<brief reasoning>\", \"actions\": [{{\"action\": \"<name>\", \"action_input\": {{...}}}}, ...]}}.\n\
+        {{\"thought\": \"<brief reasoning>\", \"actions\": [{{\"action\": \"<name>\", \"action_input\": \"<JSON-encoded string of arguments>\"}}, ...]}}.\n\
         Do not include any text outside the JSON object, and do not wrap it in markdown fences.\n\n\
         {}",
         goal_description, tools_desc
@@ -1137,6 +1224,13 @@ async fn run_agent_loop(
     let mut build_retry_count = 0usize;
     let mut consecutive_parse_failures = 0usize;
     let mut consecutive_search_count = 0usize;
+
+    // Tracks the last (action, action_input) pair executed, plus how many times in a row
+    // it has repeated verbatim. Catches a stuck agent regardless of which action it's
+    // stuck on (not just search_codebase), e.g. retrying a malformed read_file call.
+    let mut last_call: Option<(String, serde_json::Value)> = None;
+    let mut repeat_count = 0usize;
+    const MAX_IDENTICAL_REPEATS: usize = 2;
 
     'turns: for step in 1..=MAX_AGENT_STEPS {
         history.maybe_summarize(use_gemini, model).await;
@@ -1165,9 +1259,12 @@ async fn run_agent_loop(
             .trim_end_matches("```")
             .trim();
 
-        let parsed: Option<AgentTurn> = serde_json::from_str(cleaned)
+        let parsed: Option<AgentTurn> = serde_json::from_str::<AgentTurnRaw>(cleaned)
             .ok()
-            .or_else(|| extract_json_object(&raw).and_then(|s| serde_json::from_str(s).ok()));
+            .or_else(|| {
+                extract_json_object(&raw).and_then(|s| serde_json::from_str::<AgentTurnRaw>(s).ok())
+            })
+            .map(normalize_turn);
 
         let turn = match parsed {
             Some(t) if !t.actions.is_empty() => {
@@ -1188,7 +1285,8 @@ async fn run_agent_loop(
                 history.push_bare_observation(
                     "Observation: Your previous response was not valid JSON matching the required \
                     {\"thought\": ..., \"actions\": [...]} shape, or \"actions\" was empty. \
-                    Respond with ONLY the JSON object, nothing else, and include at least one action.",
+                    Respond with ONLY the JSON object, nothing else, and include at least one action. \
+                    Remember: \"action_input\" must be a JSON-ENCODED STRING, not a nested object.",
                 );
                 continue;
             }
@@ -1263,6 +1361,46 @@ async fn run_agent_loop(
             let action_name = proposed.action.clone();
             let action_input = proposed.action_input.clone();
 
+            if DEBUG_ACTIONS {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "  DEBUG: parsed action_input for '{}': {}",
+                        action_name, action_input
+                    )
+                    .dimmed()
+                );
+            }
+
+            // Repeat-call detection: if this exact (action, action_input) pair was also
+            // the last thing executed, the agent is stuck (e.g. retrying a malformed
+            // call without changing anything). A sharper, explicit nudge here matters
+            // because the tool's own error text alone clearly wasn't enough to break
+            // the loop — repeating the same error every turn doesn't teach the model
+            // anything new about what to change.
+            let is_repeat = last_call
+                .as_ref()
+                .map_or(false, |(a, i)| *a == action_name && *i == action_input);
+            if is_repeat {
+                repeat_count += 1;
+            } else {
+                repeat_count = 0;
+            }
+            last_call = Some((action_name.clone(), action_input.clone()));
+
+            if repeat_count > MAX_IDENTICAL_REPEATS && action_name != "final_answer" {
+                history.push_bare_observation(&format!(
+                    "Observation: You have called {} with the EXACT SAME action_input ({}) \
+                    {} times in a row and it keeps failing or returning the same result. \
+                    Do not repeat this call unchanged again. Re-read the tool's argument \
+                    names in the system prompt, change the input, try a different action, \
+                    or call final_answer explaining you're stuck.",
+                    action_name, action_input, repeat_count + 1
+                ));
+                repeat_count = 0;
+                continue;
+            }
+
             match action_name.as_str() {
                 "final_answer" => {
                     let answer = action_input
@@ -1306,8 +1444,13 @@ async fn run_agent_loop(
                 }
                 "read_file" => {
                     consecutive_search_count = 0;
+                    // Accept "path" (documented) but fall back to "file_path" (the name
+                    // used by write_file_edits) since smaller models frequently conflate
+                    // the two — this avoids most stuck-empty-path loops even if the
+                    // model never fully self-corrects.
                     let path = action_input
                         .get("path")
+                        .or_else(|| action_input.get("file_path"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     let start = action_input
@@ -1325,7 +1468,7 @@ async fn run_agent_loop(
                         start,
                         end
                     );
-                    let obs = tool_read_file(target_dir, path, start, end);
+                    let obs = tool_read_file(target_dir, path, start, end, &action_input);
                     history.record_step(thought.clone(), action_name, action_input, obs);
                 }
                 "list_directory" => {
@@ -2302,8 +2445,45 @@ mod tests {
     fn test_extract_json_object() {
         let text = "Sure, here you go:\n```json\n{\"action\": \"final_answer\", \"action_input\": {}}\n```\nlet me know if that helps";
         let extracted = extract_json_object(text).unwrap();
-        let parsed: AgentAction = serde_json::from_str(extracted).unwrap();
+        let parsed: ProposedActionRaw = serde_json::from_str(extracted).unwrap();
         assert_eq!(parsed.action, "final_answer");
+    }
+
+    #[test]
+    fn test_normalize_turn_string_action_input() {
+        // Simulates Gemini's constrained shape: action_input as a JSON-encoded string.
+        let raw = AgentTurnRaw {
+            thought: Some("reading a file".to_string()),
+            actions: vec![ProposedActionRaw {
+                action: "read_file".to_string(),
+                action_input: serde_json::Value::String(
+                    "{\"path\": \"index.html\", \"start_line\": 1, \"end_line\": 50}".to_string(),
+                ),
+            }],
+        };
+        let turn = normalize_turn(raw);
+        assert_eq!(turn.actions.len(), 1);
+        assert_eq!(
+            turn.actions[0].action_input.get("path").and_then(|v| v.as_str()),
+            Some("index.html")
+        );
+    }
+
+    #[test]
+    fn test_normalize_turn_object_action_input() {
+        // Simulates Ollama's looser shape: action_input already a real object.
+        let raw = AgentTurnRaw {
+            thought: None,
+            actions: vec![ProposedActionRaw {
+                action: "list_directory".to_string(),
+                action_input: serde_json::json!({"path": "."}),
+            }],
+        };
+        let turn = normalize_turn(raw);
+        assert_eq!(
+            turn.actions[0].action_input.get("path").and_then(|v| v.as_str()),
+            Some(".")
+        );
     }
 
     #[test]
@@ -2339,10 +2519,16 @@ mod tests {
         assert!(listing.contains("Cargo.toml"));
         assert!(listing.contains("src"));
 
-        let read_res = tool_read_file(".", "Cargo.toml", 1, 5);
+        let read_res = tool_read_file(".", "Cargo.toml", 1, 5, &serde_json::Value::Null);
         assert!(read_res.contains("[package]") || read_res.contains("name"));
 
-        let err_read = tool_read_file(".", "nonexistent_file_xyz.rs", 1, 10);
+        let err_read = tool_read_file(
+            ".",
+            "nonexistent_file_xyz.rs",
+            1,
+            10,
+            &serde_json::Value::Null,
+        );
         assert!(err_read.contains("Error"));
     }
 }
