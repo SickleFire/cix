@@ -46,7 +46,7 @@ struct Cli {
     target_directory: String,
 
     /// Number of context lines to display for code matches
-    #[arg(short = 'C', long, default_value_t = 1)]
+    #[arg(short = 'C', long, default_value_t = 0)]
     context: usize,
 
     /// Maximum number of top matching files to return
@@ -74,7 +74,7 @@ enum Commands {
             short = 'm',
             long,
             env = "CIX_MODEL",
-            default_value = "gemini-3.6-flash"
+            default_value = "gemini-3.5-flash-lite"
         )]
         model: String,
 
@@ -101,7 +101,7 @@ enum Commands {
             short = 'm',
             long,
             env = "CIX_MODEL",
-            default_value = "gemini-3.6-flash"
+            default_value = "gemini-3.5-flash-lite"
         )]
         model: String,
 
@@ -1081,10 +1081,10 @@ async fn run_agent_loop(
     let mut history = AgentHistory::new();
     let mut build_retry_count = 0usize;
     let mut consecutive_parse_failures = 0usize;
+    // Stall guard: counts consecutive search_codebase calls with nothing else in between.
+    let mut consecutive_search_count = 0usize;
 
     for step in 1..=MAX_AGENT_STEPS {
-        // Fold aged-out steps into the running summary (no-op until enough steps
-        // have accumulated), then render the bounded transcript for the prompt.
         history.maybe_summarize(use_gemini, model).await;
         let transcript = history.render();
 
@@ -1145,8 +1145,6 @@ async fn run_agent_loop(
             }
         }
 
-        // Captured now so we can hand them to `history.record_step(...)` once we
-        // have the observation, instead of writing straight into a flat buffer.
         let thought = action.thought.clone().unwrap_or_default();
         let action_name = action.action.clone();
         let action_input = action.action_input.clone();
@@ -1170,9 +1168,34 @@ async fn run_agent_loop(
                     .unwrap_or("");
                 println!("  {} search_codebase(\"{}\")", "Action:".cyan(), query);
                 let obs = tool_search_codebase(query, index, file_path_field, content_field);
+                let no_results = obs.contains("No results found");
+
+                consecutive_search_count += 1;
                 history.record_step(thought, action_name, action_input, obs);
+
+                if consecutive_search_count >= 3 {
+                    if no_results {
+                        history.push_bare_observation(
+                            "Observation: You have searched 3 times in a row with no results. \
+                            Stop searching with these terms. Either try ONE very different, \
+                            broader keyword (e.g. a likely function or struct name), or — if you \
+                            genuinely cannot find relevant code — call final_answer explaining \
+                            that you could not locate this in the codebase.",
+                        );
+                    } else {
+                        history.push_bare_observation(
+                            "Observation: You have called search_codebase 3 times in a row. \
+                            You already have file matches from earlier searches above — pick the \
+                            most relevant FILE path shown and call read_file on it now to see the \
+                            actual implementation before doing anything else. Do not call \
+                            search_codebase again this step.",
+                        );
+                    }
+                    consecutive_search_count = 0;
+                }
             }
             "read_file" => {
+                consecutive_search_count = 0;
                 let path = action
                     .action_input
                     .get("path")
@@ -1199,6 +1222,7 @@ async fn run_agent_loop(
                 history.record_step(thought, action_name, action_input, obs);
             }
             "list_directory" => {
+                consecutive_search_count = 0;
                 let path = action
                     .action_input
                     .get("path")
@@ -1209,6 +1233,7 @@ async fn run_agent_loop(
                 history.record_step(thought, action_name, action_input, obs);
             }
             "run_command" => {
+                consecutive_search_count = 0;
                 let cmd = action
                     .action_input
                     .get("cmd")
@@ -1227,6 +1252,7 @@ async fn run_agent_loop(
                 history.record_step(thought, action_name, action_input, obs);
             }
             "write_file_edits" if allow_write => {
+                consecutive_search_count = 0;
                 let edits_val = action
                     .action_input
                     .get("edits")
@@ -1279,6 +1305,7 @@ async fn run_agent_loop(
                 history.record_step(thought, action_name, action_input, obs);
             }
             other => {
+                consecutive_search_count = 0;
                 let obs = format!(
                     "Unknown action '{}'. Choose one of the actions listed in the system prompt.",
                     other
@@ -2009,6 +2036,17 @@ fn is_fuzzy_match(keyword: &str, word: &str) -> bool {
     let w_len = word.len();
 
     if kw_len == 0 || w_len == 0 {
+        return false;
+    }
+
+    // Exact match is always valid, regardless of length — this is what lets short
+    // identifiers like "id" or "ok" still match themselves precisely.
+    if keyword == word {
+        return true;
+    }
+
+    const MIN_LEN_FOR_FUZZY: usize = 3;
+    if kw_len < MIN_LEN_FOR_FUZZY || w_len < MIN_LEN_FOR_FUZZY {
         return false;
     }
 
