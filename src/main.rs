@@ -371,7 +371,20 @@ fn normalize_turn(raw: AgentTurnRaw) -> AgentTurn {
         .map(|a| {
             let input = match a.action_input {
                 serde_json::Value::String(s) => {
-                    serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s))
+                    match serde_json::from_str(&s) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!(
+                                "{}",
+                                format!(
+                                    "  WARNING: action_input for '{}' looked like a JSON string but failed to parse ({}). Raw: {}",
+                                    a.action, e, s
+                                )
+                                .yellow()
+                            );
+                            serde_json::Value::String(s)
+                        }
+                    }
                 }
                 other => other,
             };
@@ -530,7 +543,7 @@ fn tool_search_codebase(
     };
     let searcher = reader.searcher();
     let query_parser = QueryParser::for_index(index, vec![file_path_field, content_field]);
-    let parsed_query = parse_query_with_fuzzy(&query_parser, query);
+    let parsed_query = parse_query(&query_parser, query);
 
     let top_docs = match searcher.search(&parsed_query, &TopDocs::with_limit(5)) {
         Ok(d) => d,
@@ -593,10 +606,12 @@ fn tool_read_file(
     }
     let resolved = match resolve_file_path(path, target_dir) {
         Some(p) => p,
-        None => return format!(
-            "Error: file not found: '{}'. Call list_directory first and copy an exact path from its output.",
-            path
-        ),
+        None => {
+            return format!(
+                "Error: file not found: '{}'. Call list_directory first and copy an exact path from its output.",
+                path
+            );
+        }
     };
 
     let content = match fs::read_to_string(&resolved) {
@@ -1395,7 +1410,9 @@ async fn run_agent_loop(
                     Do not repeat this call unchanged again. Re-read the tool's argument \
                     names in the system prompt, change the input, try a different action, \
                     or call final_answer explaining you're stuck.",
-                    action_name, action_input, repeat_count + 1
+                    action_name,
+                    action_input,
+                    repeat_count + 1
                 ));
                 repeat_count = 0;
                 continue;
@@ -1403,10 +1420,16 @@ async fn run_agent_loop(
 
             match action_name.as_str() {
                 "final_answer" => {
-                    let answer = action_input
-                        .get("answer")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("(no answer text provided)");
+                    let answer = match &action_input {
+                        serde_json::Value::Object(_) => action_input
+                            .get("answer")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        serde_json::Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    }
+                    .unwrap_or_else(|| "(no answer text provided)".to_string());
+                
                     println!("\n{}", "Final answer:".bold().green());
                     println!("{}", answer);
                     return Ok(());
@@ -1791,7 +1814,7 @@ fn run_search_pipeline(
     let searcher = reader.searcher();
 
     let query_parser = QueryParser::for_index(&index, vec![file_path, content]);
-    let query = parse_query_with_fuzzy(&query_parser, query_arg);
+    let query = parse_query(&query_parser, query_arg);
 
     let top_docs = searcher.search(&query, &TopDocs::with_limit(result_limit).and_offset(0))?;
 
@@ -2234,10 +2257,8 @@ fn is_indexable_file(path_str: &str) -> bool {
 
 /// Constructs a Tantivy query from user input, applying fuzzy search terms (~1)
 /// to keywords so search handles typos and approximate matches.
-fn parse_query_with_fuzzy(
-    query_parser: &QueryParser,
-    input_text: &str,
-) -> Box<dyn tantivy::query::Query> {
+/// Constructs a Tantivy query from user input using plain keyword extraction.
+fn parse_query(query_parser: &QueryParser, input_text: &str) -> Box<dyn tantivy::query::Query> {
     let keywords = extract_keywords(input_text);
     if keywords.trim().is_empty() {
         return query_parser
@@ -2245,136 +2266,15 @@ fn parse_query_with_fuzzy(
             .unwrap_or_else(|_| query_parser.parse_query("").unwrap());
     }
 
-    let fuzzy_terms: String = keywords
-        .split_whitespace()
-        .map(|w| {
-            if w.contains('~') || w.contains('*') || w.contains(':') || w.contains('"') {
-                w.to_string()
-            } else if w.len() > 2 {
-                format!("{}~1", w)
-            } else {
-                w.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let combined_query_str = if fuzzy_terms != keywords {
-        format!("({}) OR ({})", keywords, fuzzy_terms)
-    } else {
-        keywords.clone()
-    };
-
-    if let Ok(q) = query_parser.parse_query(&combined_query_str) {
-        return q;
-    }
-
     if let Ok(q) = query_parser.parse_query(&keywords) {
-        return q;
-    }
-
-    if let Ok(q) = query_parser.parse_query(&fuzzy_terms) {
         return q;
     }
 
     query_parser.parse_query("*").unwrap()
 }
-
 /// Checks if a line matches a keyword either as a substring or via fuzzy matching.
 fn line_matches_keyword(line_lower: &str, kw: &str) -> bool {
-    if line_lower.contains(kw) {
-        return true;
-    }
-    let words = line_lower.split(|c: char| !c.is_alphanumeric() && c != '_');
-    for word in words {
-        if !word.is_empty() && is_fuzzy_match(kw, word) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Determines if two words match fuzzily based on Levenshtein distance.
-fn is_fuzzy_match(keyword: &str, word: &str) -> bool {
-    let kw_len = keyword.len();
-    let w_len = word.len();
-
-    if kw_len == 0 || w_len == 0 {
-        return false;
-    }
-
-    // Exact match is always valid, regardless of length — this is what lets short
-    // identifiers like "id" or "ok" still match themselves precisely.
-    if keyword == word {
-        return true;
-    }
-
-    const MIN_LEN_FOR_FUZZY: usize = 3;
-    if kw_len < MIN_LEN_FOR_FUZZY || w_len < MIN_LEN_FOR_FUZZY {
-        return false;
-    }
-
-    if word.contains(keyword) || keyword.contains(word) {
-        return true;
-    }
-
-    let max_dist = if kw_len <= 3 {
-        0
-    } else if kw_len <= 6 {
-        1
-    } else {
-        2
-    };
-    let len_diff = if kw_len > w_len {
-        kw_len - w_len
-    } else {
-        w_len - kw_len
-    };
-
-    if len_diff > max_dist {
-        return false;
-    }
-
-    levenshtein_distance(keyword, word) <= max_dist
-}
-
-/// Computes the Levenshtein distance between two string slices.
-fn levenshtein_distance(a: &str, b: &str) -> usize {
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    let len_a = a_chars.len();
-    let len_b = b_chars.len();
-
-    if len_a == 0 {
-        return len_b;
-    }
-    if len_b == 0 {
-        return len_a;
-    }
-
-    let mut dp = vec![vec![0; len_b + 1]; len_a + 1];
-
-    for i in 0..=len_a {
-        dp[i][0] = i;
-    }
-    for j in 0..=len_b {
-        dp[0][j] = j;
-    }
-
-    for i in 1..=len_a {
-        for j in 1..=len_b {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] {
-                0
-            } else {
-                1
-            };
-            dp[i][j] = (dp[i - 1][j] + 1)
-                .min(dp[i][j - 1] + 1)
-                .min(dp[i - 1][j - 1] + cost);
-        }
-    }
-
-    dp[len_a][len_b]
+    line_lower.contains(kw)
 }
 
 #[cfg(test)]
@@ -2389,20 +2289,6 @@ mod tests {
         assert!(!keywords.contains("how"));
         assert!(!keywords.contains("does"));
         assert!(!keywords.contains("main.rs"));
-    }
-
-    #[test]
-    fn test_levenshtein_distance() {
-        assert_eq!(levenshtein_distance("kitten", "sitting"), 3);
-        assert_eq!(levenshtein_distance("flaw", "lawn"), 2);
-        assert_eq!(levenshtein_distance("test", "test"), 0);
-    }
-
-    #[test]
-    fn test_is_fuzzy_match() {
-        assert!(is_fuzzy_match("search", "search"));
-        assert!(is_fuzzy_match("search", "seach"));
-        assert!(!is_fuzzy_match("search", "completelydifferent"));
     }
 
     #[test]
@@ -2464,7 +2350,10 @@ mod tests {
         let turn = normalize_turn(raw);
         assert_eq!(turn.actions.len(), 1);
         assert_eq!(
-            turn.actions[0].action_input.get("path").and_then(|v| v.as_str()),
+            turn.actions[0]
+                .action_input
+                .get("path")
+                .and_then(|v| v.as_str()),
             Some("index.html")
         );
     }
@@ -2481,7 +2370,10 @@ mod tests {
         };
         let turn = normalize_turn(raw);
         assert_eq!(
-            turn.actions[0].action_input.get("path").and_then(|v| v.as_str()),
+            turn.actions[0]
+                .action_input
+                .get("path")
+                .and_then(|v| v.as_str()),
             Some(".")
         );
     }
