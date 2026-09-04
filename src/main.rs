@@ -121,6 +121,14 @@ enum Commands {
         /// Skip agent loop and apply edits in a single RAG request
         #[arg(long, default_value_t = false)]
         one_shot: bool,
+
+        /// Allow the agent to commit (and optionally push) its own changes to git
+        #[arg(long, default_value_t = false)]
+        allow_git: bool,
+
+        /// When used with --allow-git, push after committing without asking for confirmation
+        #[arg(long, default_value_t = false)]
+        auto_push: bool,
     },
 }
 
@@ -236,6 +244,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         provider,
         target_directory,
         one_shot,
+        allow_git,
+        auto_push,
     }) = &cli.command
     {
         if *one_shot {
@@ -254,6 +264,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 provider,
                 target_directory,
                 &app_cache_dir,
+                *allow_git,
+                *auto_push,
             )
             .await?;
         }
@@ -732,6 +744,146 @@ async fn tool_run_command(target_dir: &str, cmd: &str) -> CommandOutput {
     }
 }
 
+/// Runs a git subcommand directly via argv (never through a shell), so commit messages and
+/// other arguments never need shell-quoting/escaping and can't be interpreted as shell syntax.
+async fn run_git_argv(target_dir: &str, args: &[&str]) -> CommandOutput {
+    let fut = TokioCommand::new("git")
+        .args(args)
+        .current_dir(target_dir)
+        .output();
+
+    match timeout(Duration::from_secs(60), fut).await {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let success = output.status.success();
+            let mut combined = format!("stdout:\n{}\nstderr:\n{}", stdout, stderr);
+            if combined.len() > 4000 {
+                combined.truncate(4000);
+                combined.push_str("\n...[truncated]");
+            }
+            CommandOutput {
+                success,
+                text: combined,
+            }
+        }
+        Ok(Err(e)) => CommandOutput {
+            success: false,
+            text: format!("Error executing 'git {}': {}", args.join(" "), e),
+        },
+        Err(_) => CommandOutput {
+            success: false,
+            text: format!("Error: 'git {}' timed out after 60 seconds", args.join(" ")),
+        },
+    }
+}
+
+/// Tool: `git_commit_and_push(message, push)`. Stages all changes, commits them with the
+/// given message, and (unless `push` is false, or `auto_push` gating requires confirmation
+/// and the user declines) pushes to the current branch's configured upstream.
+///
+/// This always shows the user a `git status --short` summary of what will be committed and
+/// asks for interactive y/N confirmation before doing anything — mirroring the confirmation
+/// already required for `write_file_edits` — unless `skip_confirmation` is true (wired to the
+/// `--auto-push` CLI flag), since pushing to a remote is a side effect outside the local
+/// filesystem and deserves the same "are you sure" gate as writing files, or an explicit
+/// opt-out.
+async fn tool_git_commit_and_push(
+    target_dir: &str,
+    message: &str,
+    push: bool,
+    skip_confirmation: bool,
+) -> String {
+    if message.trim().is_empty() {
+        return "Error: git_commit_and_push requires a non-empty \"message\".".to_string();
+    }
+
+    let inside_repo = run_git_argv(target_dir, &["rev-parse", "--is-inside-work-tree"]).await;
+    if !inside_repo.success {
+        return format!(
+            "Error: '{}' does not look like a git repository (git rev-parse failed).\n{}",
+            target_dir, inside_repo.text
+        );
+    }
+
+    let status = run_git_argv(target_dir, &["status", "--short"]).await;
+    if status.success && status.text.trim().is_empty() {
+        return "Nothing to commit — working tree is clean.".to_string();
+    }
+
+    println!("\n{}", "Proposed Git Commit:".bold().magenta());
+    println!("{}", "==================================================".dimmed());
+    println!("Message: {}", message.bold().green());
+    println!("\nChanges to be committed:");
+    for line in status.text.lines() {
+        println!("  {}", line.dimmed());
+    }
+    if push {
+        println!(
+            "\n{}",
+            "This will also PUSH to the current branch's remote.".yellow().bold()
+        );
+    }
+    println!("{}", "==================================================".dimmed());
+
+    if !skip_confirmation {
+        print!(
+            "{} [y/N]: ",
+            if push {
+                "Commit and push these changes?"
+            } else {
+                "Commit these changes?"
+            }
+        );
+        let _ = std::io::stdout().flush();
+
+        let mut input = String::new();
+        // If stdin returns EOF or errors, abort safely instead of looping
+        match std::io::stdin().read_line(&mut input) {
+            Ok(0) | Err(_) => {
+                return "Error: Non-interactive session detected; user input could not be read. Set skip_confirmation or pass --auto-push.".to_string();
+            }
+            Ok(_) => {
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    return "User declined to commit/push these changes.".to_string();
+                }
+            }
+        }
+    } else {
+        println!("{}", " --auto-push set: skipping confirmation.".dimmed());
+    }
+
+    let add_res = run_git_argv(target_dir, &["add", "-A"]).await;
+    if !add_res.success {
+        return format!("Error running 'git add -A':\n{}", add_res.text);
+    }
+
+    // Direct execution via argv array avoids Windows cmd shell quoting issues
+    let commit_res = run_git_argv(target_dir, &["commit", "-m", message]).await;
+    if !commit_res.success {
+        return format!(
+            "Error running 'git commit': (check if user.name/user.email is configured)\n{}",
+            commit_res.text
+        );
+    }
+
+    let mut result = format!("Committed successfully.\n{}", commit_res.text);
+
+    if push {
+        let push_res = run_git_argv(target_dir, &["push"]).await;
+        if push_res.success {
+            result.push_str(&format!("\nPushed successfully.\n{}", push_res.text));
+        } else {
+            result.push_str(&format!(
+                "\nCommit succeeded but push FAILED. If no upstream branch exists, run 'git push -u origin <branch>' using run_command.\n{}",
+                push_res.text
+            ));
+        }
+    }
+
+    result
+}
+
 /// Detects a reasonable build/test command for the self-correction loop based on common
 /// project marker files. Returns `None` if nothing recognizable is present, in which case
 /// the agent simply isn't given automatic build feedback.
@@ -932,26 +1084,31 @@ fn propose_and_apply_edits(edits: Vec<EditBlock>, target_dir: &str) -> (String, 
 }
 
 /// Builds the human-readable tool listing injected into the agent's system prompt.
-fn build_tools_description(allow_write: bool) -> String {
+fn build_tools_description(allow_write: bool, allow_git: bool) -> String {
     let mut desc = String::from(
         "Available actions (each \"action\" field must be exactly one of these names). \
         You may propose MULTIPLE actions in a single turn by listing them all in the \
         \"actions\" array — e.g. read three files at once, or run several searches — \
         instead of waiting a full turn per call. Rules: search_codebase, read_file, and \
-        list_directory may appear more than once per turn. run_command and \
-        write_file_edits may each appear AT MOST ONCE per turn. final_answer, if used, \
-        must be the ONLY action in its turn.\n\n\
+        list_directory may appear more than once per turn. run_command, write_file_edits, \
+        and git_commit_and_push may each appear AT MOST ONCE per turn. final_answer, if \
+        used, must be the ONLY action in its turn.\n\n\
         NOTE: \"action_input\" must be a JSON-ENCODED STRING containing the arguments \
         object, not a nested object. For example: \"action_input\": \"{\\\"path\\\": \\\"index.html\\\", \\\"start_line\\\": 1, \\\"end_line\\\": 100}\".\n\n\
         - search_codebase: arguments {\"query\": \"<search terms>\"} — full-text search the indexed codebase.\n\
         - read_file: arguments {\"path\": \"<file path>\", \"start_line\": <int>, \"end_line\": <int>} — read a bounded line range from a file. The field is \"path\", not \"file_path\".\n\
         - list_directory: arguments {\"path\": \"<relative dir path, use '.' for root>\"} — list files/subdirectories.\n\
-        - run_command: arguments {\"cmd\": \"<shell command>\"} — run a shell command in the project root (e.g. to inspect the project or run tests).\n",
+        - run_command: arguments {\"cmd\": \"<shell command>\"} — run a non-interactive shell command in the project root (e.g., build/test, inspect git status, or git push). DO NOT use run_command to run 'git commit' or 'git add' — use 'git_commit_and_push' instead to handle staging and commit messages safely.\n",
     );
     if allow_write {
         desc.push_str(
             "- write_file_edits: arguments {\"edits\": [{\"file_path\": \"...\", \"mode\": \"replace\"|\"append\"|\"create\", \"search\": \"...\", \"replace\": \"...\"}]} — propose edits to apply to disk. \
 For \"replace\", \"search\" must be copied verbatim from a file you have actually read or retrieved. For \"append\" or \"create\", omit or empty \"search\" (for \"create\", \"replace\" holds the full contents of the new file, and \"file_path\" must not already exist). The user will be asked to confirm before anything is written. Note this action uses \"file_path\" inside each edit entry — that name does NOT apply to read_file.\n",
+        );
+    }
+    if allow_git {
+        desc.push_str(
+            "- git_commit_and_push: arguments {\"message\": \"<commit message>\", \"push\": <bool, default true>} — stage ALL current changes (git add -A), commit them with \"message\", and push to the current branch's remote unless \"push\" is false. Always use this action for staging and committing changes. Write a clear, conventional commit message summarizing what changed and why.\n",
         );
     }
     desc.push_str(
@@ -1208,6 +1365,10 @@ impl AgentHistory {
 /// When `allow_write` is true (the `edit` case), a successful `write_file_edits` call is
 /// automatically followed by the project's detected build/test command; a failure is fed back
 /// to the model as an Observation so it can attempt a fix, up to `MAX_EDIT_BUILD_RETRIES` times.
+///
+/// When `allow_git` is also true, the model additionally gets access to `git_commit_and_push`
+/// so it can commit (and push) its own verified changes; `auto_push_no_confirm` controls
+/// whether that action still pauses for interactive y/N confirmation.
 async fn run_agent_loop(
     goal_description: &str,
     index: &Index,
@@ -1217,6 +1378,8 @@ async fn run_agent_loop(
     provider: &str,
     model: &str,
     allow_write: bool,
+    allow_git: bool,
+    auto_push_no_confirm: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let use_gemini = match provider.to_lowercase().as_str() {
         "gemini" => true,
@@ -1224,7 +1387,7 @@ async fn run_agent_loop(
         _ => model.to_lowercase().contains("gemini"),
     };
 
-    let tools_desc = build_tools_description(allow_write);
+    let tools_desc = build_tools_description(allow_write, allow_git);
     let system_preamble = format!(
         "You are an autonomous coding agent working inside a codebase.\n\n\
         GOAL:\n{}\n\n\
@@ -1323,6 +1486,11 @@ async fn run_agent_loop(
             .iter()
             .filter(|a| a.action == "run_command")
             .count();
+        let git_count = turn
+            .actions
+            .iter()
+            .filter(|a| a.action == "git_commit_and_push")
+            .count();
 
         if turn.actions.len() > MAX_ACTIONS_PER_TURN {
             history.push_bare_observation(&format!(
@@ -1352,6 +1520,13 @@ async fn run_agent_loop(
         if run_count > 1 {
             history.push_bare_observation(
                 "Observation: run_command may appear at most once per turn. \
+                This turn was rejected — nothing in it was executed.",
+            );
+            continue;
+        }
+        if git_count > 1 {
+            history.push_bare_observation(
+                "Observation: git_commit_and_push may appear at most once per turn. \
                 This turn was rejected — nothing in it was executed.",
             );
             continue;
@@ -1574,6 +1749,30 @@ async fn run_agent_loop(
 
                     history.record_step(thought.clone(), action_name, action_input, obs);
                 }
+                "git_commit_and_push" if allow_git => {
+                    consecutive_search_count = 0;
+                    let message = action_input
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let push = action_input
+                        .get("push")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    println!(
+                        "  {} git_commit_and_push(push={})",
+                        "Action:".cyan(),
+                        push
+                    );
+                    let obs = tool_git_commit_and_push(
+                        target_dir,
+                        message,
+                        push,
+                        auto_push_no_confirm,
+                    )
+                    .await;
+                    history.record_step(thought.clone(), action_name, action_input, obs);
+                }
                 other => {
                     consecutive_search_count = 0;
                     let obs = format!(
@@ -1624,18 +1823,25 @@ async fn run_ask_agent_pipeline(
         provider,
         model,
         false,
+        false,
+        false,
     )
     .await
 }
 
 /// Sets up the index and runs the write-enabled agent loop to carry out a code edit,
-/// automatically verifying the result with a build/test check when possible.
+/// automatically verifying the result with a build/test check when possible. When
+/// `allow_git` is true the agent may additionally commit (and, unless it's declined
+/// interactively, push) its own verified changes via `git_commit_and_push`; `auto_push`
+/// controls whether that commit/push still pauses for a y/N confirmation.
 async fn run_edit_agent_pipeline(
     instruction: &str,
     model: &str,
     provider: &str,
     target_dir: &str,
     app_cache_dir: &std::path::Path,
+    allow_git: bool,
+    auto_push: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{}",
@@ -1643,18 +1849,28 @@ async fn run_edit_agent_pipeline(
     );
     let (index, file_path_field, content_field) = ensure_index(target_dir, false, app_cache_dir)?;
 
-    let goal = format!(
+    let mut goal = format!(
         "Modify the codebase to satisfy the following instruction. Investigate with \
         search_codebase / read_file / list_directory first so your edits are grounded in the \
         real file contents. If the directory is empty or the relevant files don't exist yet, \
         don't keep re-listing it — go straight to write_file_edits with mode \"create\" to \
         author the needed files. After edits are applied you will automatically be shown the \
         result of the project's build/test check — if it fails, analyze the error and propose \
-        a fix. Call final_answer once the change is complete (or once you've made a best effort \
+        a fix.",
+        );
+    if allow_git {
+        goal.push_str(
+            " Once your edits are complete and the build/test check has passed, use \
+            git_commit_and_push to commit (and push) the change with a clear commit message \
+            summarizing what you did. Do not commit before the build/test check passes.",
+        );
+    }
+    goal.push_str(&format!(
+        " Call final_answer once the change is complete (or once you've made a best effort \
         and should report status/blockers).\n\n\
         INSTRUCTION:\n{}",
         instruction
-    );
+    ));
 
     run_agent_loop(
         &goal,
@@ -1665,6 +1881,8 @@ async fn run_edit_agent_pipeline(
         provider,
         model,
         true,
+        allow_git,
+        auto_push,
     )
     .await
 }
