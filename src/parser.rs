@@ -11,9 +11,9 @@ pub struct RustSymbol {
 
 pub fn parse_rust_symbols(source_code: &str) -> Vec<RustSymbol> {
     let mut parser = Parser::new();
-    let language = tree_sitter_rust::LANGUAGE;
+    let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
     parser
-        .set_language(&language.into())
+        .set_language(&language)
         .expect("Error loading Rust language");
 
     let tree: tree_sitter::Tree = match parser.parse(source_code.as_bytes(), None) {
@@ -79,9 +79,9 @@ fn extract_symbol(node: Node, source: &str) -> Option<RustSymbol> {
 
 pub fn print_ast(source_code: &str) {
     let mut parser = Parser::new();
-    let language = tree_sitter_rust::LANGUAGE;
+    let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
     parser
-        .set_language(&language.into())
+        .set_language(&language)
         .expect("Error loading Rust language");
 
     if let Some(tree) = parser.parse(source_code.as_bytes(), None) {
