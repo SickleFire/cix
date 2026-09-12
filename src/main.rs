@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::Parser as ClapParser;
 use colored::*;
 use ignore::WalkBuilder;
 use std::collections::hash_map::DefaultHasher;
@@ -10,7 +10,10 @@ use tantivy::query::QueryParser;
 use tantivy::schema::*;
 use tantivy::{Index, ReloadPolicy, TantivyDocument, Term, doc};
 
-#[derive(Parser, Debug)]
+// Import parser functions from library
+use cix::parser::{parse_rust_symbols, print_ast};
+
+#[derive(ClapParser, Debug)]
 #[command(
     name = "cix",
     author,
@@ -19,7 +22,7 @@ use tantivy::{Index, ReloadPolicy, TantivyDocument, Term, doc};
 )]
 struct Cli {
     /// Search query term
-    #[arg(required_unless_present = "clean")]
+    #[arg(required_unless_present_all = ["clean", "ast", "symbols"])]
     search_query: Option<String>,
 
     /// Target directory to index and search (defaults to current directory)
@@ -41,6 +44,14 @@ struct Cli {
     /// Remove all cached indexes
     #[arg(long, default_value_t = false)]
     clean: bool,
+
+    /// Print AST for a given source file
+    #[arg(long, value_name = "FILE")]
+    ast: Option<String>,
+
+    /// Print parsed symbols for a given source file
+    #[arg(long, value_name = "FILE")]
+    symbols: Option<String>,
 }
 
 fn main() -> tantivy::Result<()> {
@@ -66,7 +77,44 @@ fn main() -> tantivy::Result<()> {
         return Ok(());
     }
 
-    // Unwrap arguments (clap guarantees present when --clean is false)
+    // Handle --ast option early
+    if let Some(ref file_path) = cli.ast {
+        match fs::read_to_string(file_path) {
+            Ok(content) => {
+                println!("{} {}", "AST for file:".cyan().bold(), file_path.green());
+                print_ast(&content);
+            }
+            Err(e) => {
+                eprintln!("Failed to read file '{}': {}", file_path, e);
+            }
+        }
+        return Ok(());
+    }
+
+    // Handle --symbols option early
+    if let Some(ref file_path) = cli.symbols {
+        match fs::read_to_string(file_path) {
+            Ok(content) => {
+                println!("{} {}", "Symbols for file:".cyan().bold(), file_path.green());
+                let symbols = parse_rust_symbols(&content);
+                for sym in symbols {
+                    println!(
+                        "  [{}] {} (line {}) -> {}",
+                        sym.kind.yellow(),
+                        sym.name.green().bold(),
+                        sym.line,
+                        sym.signature.dimmed()
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to read file '{}': {}", file_path, e);
+            }
+        }
+        return Ok(());
+    }
+
+    // Unwrap arguments (clap guarantees present when --clean, --ast, and --symbols are false)
     let query_target_directory = &cli.target_directory;
     let query_arg = cli.search_query.as_ref().unwrap();
     let context_size = cli.context;
