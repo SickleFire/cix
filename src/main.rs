@@ -12,7 +12,6 @@ use tantivy::{Index, ReloadPolicy, TantivyDocument, Term, doc};
 
 // Import parser functions from library
 use cix::parser::{parse_rust_symbols, print_ast};
-use cix::embedding::SemanticSearcher;
 
 #[derive(ClapParser, Debug)]
 #[command(
