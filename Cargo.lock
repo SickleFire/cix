@@ -193,6 +193,7 @@ dependencies = [
  "colored",
  "dirs",
  "ignore",
+ "serde",
  "tantivy",
  "tree-sitter",
  "tree-sitter-rust",

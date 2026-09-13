@@ -1,4 +1,5 @@
 pub mod parser;
+pub mod embedding;
 
 #[cfg(test)]
 mod tests {
