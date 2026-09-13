@@ -22,7 +22,7 @@ use cix::parser::{parse_rust_symbols, print_ast};
 )]
 struct Cli {
     /// Search query term
-    #[arg(required_unless_present_all = ["clean", "ast", "symbols"])]
+    #[arg(required_unless_present = "symbols", required_unless_present_all = ["clean", "ast"])]
     search_query: Option<String>,
 
     /// Target directory to index and search (defaults to current directory)
